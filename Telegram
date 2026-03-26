@@ -11,8 +11,8 @@ let COL_IDX = {};
 // ===================== НАСТРОЙКИ И КОНСТАНТЫ =====================
 const CONFIG = {
   TOKEN: '8230908280:AAEaky2wog0lVM62qtcsaFcFXU-yipweAZA',
-  CHAT_ID: '-1003283469910',   //тест - -1003570835806, релиз - -1003283469910
-  CHAT_ID_PERSONAL: '2035315338',
+  CHAT_ID: '-1003570835806',   //тест - -1003570835806, релиз - -1003283469910
+  CHAT_ID_PERSONAL: '5511276928',   //тест - 5511276928, релиз - 7365653720
   DEBUG: false,
   
   SPREADSHEET_ID: '1ixHPQRRYuLbeU1nCpFsRAILHZUn8rfqx4_LVQ-GL-hA',
@@ -64,9 +64,9 @@ const CONFIG = {
   },
 
   ONLINER_PRINT: {
-    TEMPLATE_TUF_ID: '',
-    TEMPLATE_INOTE_ID: '',
-    OUTPUT_FOLDER_ID: ''
+    TEMPLATE_TUF_ID: '1G3M5tROpmCoZwrSgMUObQZhijEKwEQ-KG6nA_6RxbO0',
+    TEMPLATE_INOTE_ID: '1E5Q8EgNS6FgnjjLn1jXi8UYIIdsU7Yrd48K4XHjduRQ',
+    OUTPUT_FOLDER_ID: '1DXEKv6kDtnPdOQWKW0nLCrWoyaCCFNf_'
   }
 };
 
