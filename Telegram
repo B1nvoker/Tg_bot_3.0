@@ -1211,9 +1211,7 @@ function mapRowToCheckSummary(row) {
 }
 
 function createPrintDocumentsForBot(baseRows = null) {
-  if (!CONFIG.CHAT_ID_PERSONAL) {
-    throw new Error('CONFIG.CHAT_ID_PERSONAL не задан');
-  }
+  const targetChatId = CONFIG.CHAT_ID_PERSONAL || CONFIG.CHAT_ID;
 
   const { TEMPLATE_TUF_ID, TEMPLATE_INOTE_ID, OUTPUT_FOLDER_ID } = CONFIG.ONLINER_PRINT;
   if (!TEMPLATE_TUF_ID || !TEMPLATE_INOTE_ID || !OUTPUT_FOLDER_ID) {
@@ -1294,12 +1292,12 @@ function createPrintDocumentsForBot(baseRows = null) {
   );
 
   if (orderNumbers.length) {
-    const ordersText = `📋 Номера заказов:\n${orderNumbers.map((num, idx) => `${idx + 1}. ${num}`).join('\n')}`;
-    sendMessage(ordersText, null, CONFIG.CHAT_ID_PERSONAL, CONFIG.SEND_MODE.FAST, null, { markdown: false });
+    const ordersText = `📋 Номера заказов на ${today} (${orderNumbers.length}):\n${orderNumbers.map((num, idx) => `${idx + 1}. ${num}`).join('\n')}`;
+    sendMessage(ordersText, null, targetChatId, CONFIG.SEND_MODE.FAST, null, { markdown: false });
   }
 
-  sendMessage(`Гарантийные талоны\n${mergedFile.getUrl()}`, null, CONFIG.CHAT_ID_PERSONAL, CONFIG.SEND_MODE.FAST, null, { markdown: false });
-  sendMessage(`Чеки\n${checksSpreadsheet.getUrl()}`, null, CONFIG.CHAT_ID_PERSONAL, CONFIG.SEND_MODE.FAST, null, { markdown: false });
+  sendMessage(`Гарантийные талоны\n${mergedFile.getUrl()}`, null, targetChatId, CONFIG.SEND_MODE.FAST, null, { markdown: false });
+  sendMessage(`Чеки\n${checksSpreadsheet.getUrl()}`, null, targetChatId, CONFIG.SEND_MODE.FAST, null, { markdown: false });
 }
 
 function sendPrintDocumentsOnBotStart() {
@@ -1397,7 +1395,10 @@ function collectSuppliersForToday() {
     const supplierGroups = {};
 
     data.forEach((row, i) => {
-      const rowDateStr = getRowDateString(row[getOrdersDateColumnIndex()]);
+      const supplierDateIndex = typeof COL_IDX.DATE === 'number'
+        ? COL_IDX.DATE
+        : getOrdersDateColumnIndex();
+      const rowDateStr = getRowDateString(row[supplierDateIndex]);
       if (rowDateStr !== todayStr) return;
       
       const supName = String(row[COL_IDX.SUPPLIER]).trim();
@@ -1496,8 +1497,11 @@ function sendOrdersToTelegram() {
       // 🔥 2. ИНИЦИАЛИЗИРУЕМ КОЛОНКИ (с кэшированием)
       initColumns();
       
-      // 🔥 2. КЭШИРУЕМ ДАННЫЕ ПОСТАВЩИКОВ (ИСПРАВЛЕННЫЙ КОД)
-      const { supInfo } = getSuppliersData(); 
+	      // 🔥 2. КЭШИРУЕМ ДАННЫЕ ПОСТАВЩИКОВ (ИСПРАВЛЕННЫЙ КОД)
+	      const { supInfo } = getSuppliersData(); 
+	      
+	      // Отправка номеров заказов и ссылок на документы в личный чат
+	      sendPrintDocumentsOnBotStart();
 
     // 1. ✅ Заказы — ВСЕ за сегодня по колонке "Дата отгрузки"
     const ordersSheet = SpreadsheetApp
@@ -2104,10 +2108,13 @@ function handleCallback(cb) {
           return answerCb(cb.id, '❌ Ошибка: Данные заказа устарели. Нажмите кнопку заново.');
         }
       
-        let sum = getWithTTL(`real_price_${uid}`) || saved.totalPrice;
-    const isCash = CONFIG.PAYMENT_TYPES.CASH.includes(String(saved.payment).toLowerCase());
-    
-    writeReport(isCash ? sum : '', '', isCash ? 'Продажа' : `Продажа ${saved.payment}`, saved.orderNumbers, userName);
+	    const changedSum = getWithTTL(`real_price_${uid}`);
+	    let sum = changedSum || saved.totalPrice;
+	    const isCash = CONFIG.PAYMENT_TYPES.CASH.includes(String(saved.payment).toLowerCase());
+	    const purpose = changedSum
+	      ? `Изм. суммы ->${saved.orderNumbers} (было ${saved.totalPrice}, стало ${changedSum})`
+	      : saved.orderNumbers;
+	    writeReport(isCash ? sum : '', '', isCash ? 'Продажа' : `Продажа ${saved.payment}`, purpose, userName);
     
     saved.orderNumbers.split(',').forEach(num => updateStatusByOrderNum(num.trim(), 'Продан'));
     
@@ -2138,8 +2145,9 @@ function handleCallback(cb) {
     
     setWithTTL(`price_step_${chatId}`, uid, 30);
     editMessageReplyMarkup(chatId, msgId, { inline_keyboard: [] });
-    sendMessage(`💰 Введите реальную сумму для заказа ${getWithTTL(uid).orderNumbers}`, null, chatId);
-    return answerCb(cb.id, '');
+	    const savedOrder = getWithTTL(uid);
+	    sendMessage(`💰 Введите измененную цену для заказа ${savedOrder.orderNumbers}`, null, chatId, CONFIG.SEND_MODE.FAST, null, { markdown: false });
+	    return answerCb(cb.id, '');
   }
 
   // ================= NOT DELIVERED / NOT SENT =================
@@ -2396,7 +2404,7 @@ if (data.startsWith('gm_supplier_')) {
     if (!task) return answerCb(cb.id, 'Устарело');
 
     setWithTTL(`extra_edit_sum_${chatId}`, uid, 5); // Состояние ожидания суммы на 5 мин
-    sendMessage(`✏️ Введите новую сумму для:\n*${mdSafe(task.todo || task.sup)}*`, null, chatId);
+    sendMessage(`✏️ Введите новую сумму для:\n${task.todo || task.sup}`, null, chatId, CONFIG.SEND_MODE.FAST, null, { markdown: false });
     return answerCb(cb.id, 'Жду сумму...');
   }
 
@@ -2932,21 +2940,19 @@ function sendMoneyBalance(chatId) {
       return;
     }
     
-    // 🔥 ПРЯМОЕ ЧТЕНИЕ ИЗ КОНКРЕТНЫХ ЯЧЕЕК (G1 и H1)
+    // 🔥 ПРЯМОЕ ЧТЕНИЕ ИЗ КОНКРЕТНЫХ ЯЧЕЕК (K2 и L2)
     let byn = '', usd = '';
     
     try {
-      // BYN находится в ячейке G1 (столбец 7, строка 1)
-      byn = sheet.getRange('G1').getValue();
+      byn = sheet.getRange('K2').getValue();
     } catch (e) {
-      console.warn('Не удалось прочитать BYN из G1:', e.message);
+      console.warn('Не удалось прочитать BYN из K2:', e.message);
     }
     
     try {
-      // USD находится в ячейке H1 (столбец 8, строка 1)
-      usd = sheet.getRange('H1').getValue();
+      usd = sheet.getRange('L2').getValue();
     } catch (e) {
-      console.warn('Не удалось прочитать USD из H1:', e.message);
+      console.warn('Не удалось прочитать USD из L2:', e.message);
     }
     
     // 🔥 ФОРМАТИРУЕМ ДЛЯ ОТОБРАЖЕНИЯ (два знака после запятой)
