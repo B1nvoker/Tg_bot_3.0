@@ -1,0 +1,1208 @@
+// =====================  Onliner 2.0 =====================
+
+// ===================== КОНСТАНТЫ И КОНФИГУРАЦИЯ =====================
+const ONLINER_CONFIG = {
+  API: {
+    BASE_URL: 'https://cart.api.onliner.by',
+    AUTH_URL: 'https://b2bapi.onliner.by/oauth/token',
+    CLIENT_TOKENS: {
+      TUF: 'MTE1ZGY4M2QyMGM2MGIzMGI5OWQ6YjBkODk2MmM1MzIyYzBmOWZjZDhhZGUyNDk4ZjMwZmE5ZDZmNGU4NA==',
+      INOTE: 'YzJmMWUwNzY3YTE5YmM4MzViZDc6YmQxMWM3OGNmYmZhZjY1MTBjYmRkZDI3OWM4NTIxNjJhMTdjNjcxNA=='
+    }
+  },
+  
+  PAYMENT_METHODS: {
+    online: 'Onliner pay',
+    halva: 'Халва',
+    for_national_goods: 'На родныя тавары',
+    terminal: 'Карта',
+    cashless: 'Перевод для юрлиц',
+    by_parts: 'Minipay',
+    default: 'Наличные'
+  },
+  
+  TEMPLATES: {
+    INOTE: '1E5Q8EgNS6FgnjjLn1jXi8UYIIdsU7Yrd48K4XHjduRQ',
+    TUF: '1G3M5tROpmCoZwrSgMUObQZhijEKwEQ-KG6nA_6RxbO0'
+  },
+  
+  FOLDERS: {
+    TEMP: '107kKSkBG2b8S5IySN6tUDi-eoxB5M7_k'
+  },
+  
+  SPREADSHEETS: {
+    SOURCE: '1ixHPQRRYuLbeU1nCpFsRAILHZUn8rfqx4_LVQ-GL-hA',
+    TARGET: '1ezIVmPrHtWCZJGZ0qiEDYRUFhFzVlZghzVSI29sVlyk'
+  },
+  
+  SHEET_COLUMNS: {
+    STATUS: 0,
+    DATE_ORDER: 1,
+    DATE_SUPPLIER: 2,
+    DATE_DELIVERY: 3,
+    ORDER_NUMBER: 4,
+    COMMENT: 6,
+    DELIVERY_TYPE: 7,
+    SOURCE: 8,
+    CATEGORY: 9,
+    SERIAL_NUMBER: 10,
+    MODEL: 11,
+    SUPPLIER: 12,
+    CLIENT_NAME: 13,
+    CLIENT_PHONE: 14,
+    CLIENT_ADDRESS: 15,
+    PAYMENT_TYPE: 16,
+    SUPPLIER_PRICE_BYN: 17,
+    SALE_PRICE: 19,
+    DELIVERY_PRICE: 20,
+    OTHER_PRICE: 21,
+    FINAL_PRICE: 22,
+    DELIVERY_PAYMENT_PRICE: 24,
+    WARRANTY_BASE: 28,     // AC - базовая гарантия
+    WARRANTY_FULL: 34,     // AI - полная гарантия
+    WARRANTY: 34           // для обратной совместимости
+  }
+};
+
+// ===================== УТИЛИТЫ ОБЩЕГО НАЗНАЧЕНИЯ =====================
+
+/**
+ * Форматирование суммы в BYN
+ */
+function formatBYN(value, separator = ' ') {
+  const amount = typeof value === 'string' 
+    ? parsePrice(value)
+    : Number(value);
+  
+  if (isNaN(amount) || amount == null) return '';
+  
+  const [integer, decimal] = Math.abs(amount).toFixed(2).split('.');
+  const sign = amount < 0 ? '-' : '';
+  
+  const formattedInteger = integer
+    .split('')
+    .reverse()
+    .join('')
+    .replace(/(\d{3})(?=\d)/g, `$1${separator}`)
+    .split('')
+    .reverse()
+    .join('');
+  
+  return `${sign}${formattedInteger},${decimal}`;
+}
+
+/**
+ * Правильное склонение слова "месяц"
+ */
+function pluralizeMonths(n) {
+  if (n % 10 === 1 && n % 100 !== 11) return 'месяц';
+  if ([2,3,4].includes(n % 10) && ![12,13,14].includes(n % 100)) return 'месяца';
+  return 'месяцев';
+}
+
+/**
+ * Нормализация телефона
+ */
+function normalizePhone(phone) {
+  if (!phone) return '';
+  
+  return String(phone)
+    .replace(/^(\+375|375|80)/, '')
+    .replace(/[^\d]/g, '')
+    .substring(0, 9);
+}
+
+/**
+ * Парсинг цены из строки
+ */
+function parsePrice(value) {
+  return Number(
+    String(value || '')
+      .replace(/\u00A0/g, '')
+      .replace(/\s/g, '')
+      .replace(',', '.')
+  ) || 0;
+}
+
+// ===================== КЭШИРОВАНИЕ ТОКЕНОВ =====================
+const tokenCache = {};
+
+/**
+ * Получение токена с кэшированием
+ */
+function getCachedToken(clientType = 'TUF') {
+  const cacheKey = `${clientType}_token`;
+  const now = Date.now();
+  
+  // Проверяем наличие валидного токена в кэше (50 минут)
+  if (tokenCache[cacheKey] && tokenCache[cacheKey].expires > now) {
+    Logger.log(`Используем кэшированный токен для ${clientType}`);
+    return tokenCache[cacheKey].token;
+  }
+  
+  // Получаем новый токен
+  const token = getOnlinerTokenRaw(clientType);
+  
+  // Сохраняем в кэш
+  tokenCache[cacheKey] = {
+    token: token,
+    expires: now + (50 * 60 * 1000) // 50 минут
+  };
+  
+  Logger.log(`Новый токен получен и кэширован для ${clientType}`);
+  return token;
+}
+
+/**
+ * Получение токена авторизации Onliner (базовая версия)
+ */
+function getOnlinerTokenRaw(clientType = 'TUF') {
+  const authToken = ONLINER_CONFIG.API.CLIENT_TOKENS[clientType];
+  if (!authToken) throw new Error(`Неизвестный тип клиента: ${clientType}`);
+  
+  try {
+    const response = UrlFetchApp.fetch(ONLINER_CONFIG.API.AUTH_URL, {
+      method: 'post',
+      contentType: 'application/x-www-form-urlencoded',
+      payload: 'grant_type=client_credentials',
+      headers: {
+        Accept: 'application/json',
+        Authorization: `Basic ${authToken}`
+      },
+      muteHttpExceptions: true
+    });
+    
+    const responseCode = response.getResponseCode();
+    if (responseCode !== 200) {
+      throw new Error(`Ошибка авторизации Onliner: код ${responseCode}`);
+    }
+    
+    const data = JSON.parse(response.getContentText());
+    return data.access_token;
+  } catch (error) {
+    Logger.error(`Ошибка получения токена для ${clientType}: %s`, error.message);
+    throw error;
+  }
+}
+
+/**
+ * Получение токена авторизации Onliner (публичная функция с кэшем)
+ */
+function getOnlinerToken(clientType = 'TUF') {
+  return getCachedToken(clientType);
+}
+
+// ===================== ONLINER API =====================
+
+/**
+ * Универсальная функция для вставки данных (PRODUCTION-READY ВЕРСИЯ)
+ * Оптимальная стратегия: 1 чтение + 1 запись
+ */
+
+/**
+ * Получение данных заказа с Onliner (API)
+ */
+function fetchOrderData(orderCode, token) {
+  const url = `${ONLINER_CONFIG.API.BASE_URL}/orders/${orderCode}?include=positions`;
+
+  const response = UrlFetchApp.fetch(url, {
+    method: 'get',
+    headers: {
+      Accept: 'application/json; charset=utf-8',
+      Authorization: `Bearer ${token}`
+    },
+    muteHttpExceptions: true
+  });
+
+  const code = response.getResponseCode();
+  if (code !== 200) {
+    throw new Error(`Onliner API error ${code}: ${response.getContentText()}`);
+  }
+
+  return JSON.parse(response.getContentText());
+}
+
+/**
+ * Универсальная функция для вставки данных (PRODUCTION-READY ВЕРСИЯ)
+ * Оптимальная стратегия: 1 чтение + 1 запись
+ */
+function insertDataOptimized(sheet, positions, order, source, paymentType, startRow) {
+  const cols = {
+    1:  [], // A статус - ДОБАВЛЕНО
+    5:  [], // E номер заказа
+    9:  [], // I источник
+    12: [], // L модель
+    14: [], // N ФИО
+    15: [], // O телефон
+    16: [], // P адрес
+    17: [], // Q оплата
+    20: [], // T цена позиции
+    21: [], // U доставка
+    35: []  // AH гарантия
+  };
+
+  positions.forEach(p => {
+    const delivery = order.delivery?.price?.amount
+      ? order.delivery.price.amount.replace('.', ',')
+      : '0,00';
+
+    cols[1].push(['Заказан']);  // 👈 СТОЛБЕЦ A - СТАТУС
+    cols[5].push([order.key]);
+    cols[9].push([source]);
+    cols[12].push([p.product.full_name]);
+    cols[14].push([order.contact.name]);
+    cols[15].push([order.contact.phone]);
+    cols[16].push([`${order.delivery.city}, ${order.delivery.address}`]);
+    cols[17].push([paymentType]);
+    cols[20].push([p.position_price.amount.replace('.', ',')]);
+    cols[21].push([delivery]);
+    cols[35].push([p.warranty]);
+  });
+
+  writeColumnsSafe(sheet, startRow, cols);
+
+  return {
+    positionsCount: positions.length,
+    startRow,
+    endRow: startRow + positions.length - 1,
+    orderNumber: order.key
+  };
+}
+
+/**
+ * Вставка данных в текущую позицию курсора (ФИНАЛЬНАЯ ВЕРСИЯ)
+ */
+function insertAtActiveCell(order, source) {
+  const sheet = SpreadsheetApp.getActiveSheet();
+  
+  // Защита от выбора заголовка или пустой строки
+  const activeRow = sheet.getActiveCell().getRow();
+  const startRow = Math.max(activeRow, 2); // Не позволяем вставлять выше строки 2
+  
+  const paymentType = ONLINER_CONFIG.PAYMENT_METHODS[order.payment?.type] || 
+                     ONLINER_CONFIG.PAYMENT_METHODS.default;
+
+  const positions = order.positions || [];
+  if (!positions.length) {
+    throw new Error('В заказе нет позиций');
+  }
+
+  // Используем оптимизированную версию
+  return insertDataOptimized(sheet, positions, order, source, paymentType, startRow);
+}
+
+/**
+ * Добавление заказа в конец таблицы (ФИНАЛЬНАЯ ВЕРСИЯ)
+ */
+function insertOrderAtEnd(order, source) {
+  const sheet = SpreadsheetApp.getActiveSheet();
+  const lastRow = Math.max(sheet.getLastRow(), 1); // Минимум строка 1
+  const startRow = lastRow + 1;
+
+  const paymentType = ONLINER_CONFIG.PAYMENT_METHODS[order.payment?.type] || 
+                     ONLINER_CONFIG.PAYMENT_METHODS.default;
+
+  const positions = order.positions || [];
+  if (!positions.length) {
+    throw new Error('В заказе нет позиций');
+  }
+
+  // Используем оптимизированную версию
+  return insertDataOptimized(sheet, positions, order, source, paymentType, startRow);
+}
+
+/**
+ * Получение данных заказа с Onliner (универсальная функция) - ИСПРАВЛЕННАЯ
+ */
+function getOnlinerOrder(clientType, orderCode, options = {}) {
+  const defaults = {
+    insertMode: 'activeCell',  // 'activeCell' | 'append' | 'replace'
+    showAlert: true,
+    optimized: true  // Использовать оптимизированную версию (реально работает)
+  };
+  const settings = { ...defaults, ...options };
+  
+  try {
+    const token = getOnlinerToken(clientType);
+    const orderData = fetchOrderData(orderCode, token);
+    
+    let result;
+    const sourceName = `Корзина ${clientType.toLowerCase()}(o)`;
+    
+    switch (settings.insertMode) {
+      case 'append':
+        result = insertOrderAtEnd(orderData, sourceName);
+        break;
+      case 'replace':
+        result = replaceCurrentRange(orderData, sourceName);
+        break;
+      case 'activeCell':
+      default:
+        result = insertAtActiveCell(orderData, sourceName);
+        break;
+    }
+    
+    if (settings.showAlert) {
+      showSuccessAlert(result.positionsCount, clientType);
+    }
+    
+    return result;
+    
+  } catch (error) {
+    Logger.error('Ошибка получения заказа %s (%s): %s', clientType, orderCode, error.message);
+    
+    if (settings.showAlert) {
+      showErrorAlert(`Не удалось загрузить заказ ${clientType}: ${error.message}`);
+    }
+    
+    throw error;
+  }
+}
+
+/**
+ * Замена текущего выделенного диапазона (ОПТИМИЗИРОВАННАЯ ВЕРСИЯ)
+ */
+function replaceCurrentRange(order, source) {
+  const sheet = SpreadsheetApp.getActiveSheet();
+  const selection = sheet.getActiveRange();
+  
+  if (!selection) {
+    throw new Error('Не выделен диапазон для замены');
+  }
+
+  const startRow = selection.getRow();
+  const rowCount = selection.getNumRows();
+  const positions = order.positions || [];
+  
+  if (positions.length > rowCount) {
+    throw new Error(`Выделено ${rowCount} строк, но в заказе ${positions.length} позиций`);
+  }
+
+  const paymentType = ONLINER_CONFIG.PAYMENT_METHODS[order.payment?.type] || 
+                     ONLINER_CONFIG.PAYMENT_METHODS.default;
+
+  if (rowCount > positions.length) {
+    sheet
+      .getRange(startRow + positions.length, 1, rowCount - positions.length, sheet.getLastColumn())
+      .clearContent();
+  }
+
+  return insertDataOptimized(
+    sheet,
+    positions,
+    order,
+    source,
+    paymentType,
+    startRow
+  );
+}
+// ===================== UI ФУНКЦИИ (ВЫНЕСЕНЫ ОТДЕЛЬНО) =====================
+
+/**
+ * Показать успешное уведомление
+ */
+function showSuccessAlert(count, clientType) {
+  SpreadsheetApp.getUi().alert(
+    '✅ Успешно',
+    `Добавлено ${count} позиций заказа ${clientType}.`,
+    SpreadsheetApp.getUi().ButtonSet.OK
+  );
+}
+
+/**
+ * Показать сообщение об ошибке
+ */
+function showErrorAlert(message) {
+  SpreadsheetApp.getUi().alert(
+    '❌ Ошибка',
+    message,
+    SpreadsheetApp.getUi().ButtonSet.OK
+  );
+}
+
+/**
+ * Запрос кода заказа у пользователя
+ */
+function promptOrderCode(title) {
+  const ui = SpreadsheetApp.getUi();
+  const response = ui.prompt(title, 'Введите код заказа:', ui.ButtonSet.OK_CANCEL);
+  
+  if (response.getSelectedButton() !== ui.Button.OK) {
+    return null;
+  }
+  
+  const orderCode = response.getResponseText().trim();
+  if (!orderCode) {
+    showErrorAlert('Вы не ввели код заказа.');
+    return null;
+  }
+  
+  return orderCode;
+}
+
+// ===================== МЕНЮ-ФУНКЦИИ (ОБНОВЛЕННЫЕ) =====================
+
+/**
+ * Функция для меню: получение заказа TUF (в текущую позицию)
+ */
+function menuGetOrderTuf() {
+  const orderCode = promptOrderCode('Получить заказ TUF');
+  if (!orderCode) return;
+  
+  try {
+    getOnlinerOrder('TUF', orderCode, { insertMode: 'activeCell' });
+  } catch (error) {
+    // Ошибка уже обработана в getOnlinerOrder
+  }
+}
+
+/**
+ * Функция для меню: получение заказа Inote (в текущую позицию)
+ */
+function menuGetOrderInote() {
+  const orderCode = promptOrderCode('Получить заказ Inote');
+  if (!orderCode) return;
+  
+  try {
+    getOnlinerOrder('INOTE', orderCode, { insertMode: 'activeCell' });
+  } catch (error) {
+    // Ошибка уже обработана в getOnlinerOrder
+  }
+}
+
+/**
+ * Запуск с fallback механизмом (обновленная версия)
+ */
+function runWithFallback() {
+  const orderCode = promptOrderCode('Получить заказ (автоматический выбор)');
+  if (!orderCode) return;
+  
+  try {
+    // Пытаемся получить через TUF
+    getOnlinerOrder('TUF', orderCode, { insertMode: 'activeCell' });
+  } catch (error) {
+    Logger.log('Fallback to Inote:', error.message);
+    try {
+      // Пробуем через INOTE
+      getOnlinerOrder('INOTE', orderCode, { insertMode: 'activeCell' });
+    } catch (fallbackError) {
+      showErrorAlert(`Не удалось загрузить заказ ни через TUF, ни через Inote: ${fallbackError.message}`);
+    }
+  }
+}
+
+// ===================== ДОКУМЕНТЫ И ШАБЛОНЫ =====================
+
+/**
+ * Замена текста в элементах документа
+ */
+function replaceInDocumentElement(element, replacements) {
+  const elementType = element.getType();
+  
+  if (elementType === DocumentApp.ElementType.PARAGRAPH) {
+    const paragraph = element.asParagraph();
+    Object.keys(replacements).forEach(key => {
+      const pattern = key.replace(/[{}]/g, '\\$&');
+      paragraph.replaceText(pattern, String(replacements[key]));
+    });
+    return;
+  }
+  
+  if (elementType === DocumentApp.ElementType.TABLE) {
+    const table = element.asTable();
+    for (let row = 0; row < table.getNumRows(); row++) {
+      const tableRow = table.getRow(row);
+      for (let cell = 0; cell < tableRow.getNumCells(); cell++) {
+        const tableCell = tableRow.getCell(cell);
+        for (let i = 0; i < tableCell.getNumChildren(); i++) {
+          const child = tableCell.getChild(i);
+          if (child.getType() === DocumentApp.ElementType.PARAGRAPH) {
+            replaceInDocumentElement(child, replacements);
+          }
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Копирование и обработка шаблонов
+ */
+function copyAndProcessTemplate(templateId, folderId, fileName) {
+  const templateFile = DriveApp.getFileById(templateId);
+  const tempFolder = DriveApp.getFolderById(folderId);
+  
+  const tempFile = templateFile.makeCopy(fileName, tempFolder);
+  const tempDoc = DocumentApp.openById(tempFile.getId());
+  
+  return { file: tempFile, doc: tempDoc };
+}
+/**
+ * Создание печатных документов (С УМНОЙ ПОДСТАНОВКОЙ ГАРАНТИИ И ПРАВИЛЬНЫМ СКЛОНЕНИЕМ)
+ */
+function createPrintDocuments() {
+  try {
+    const ui = SpreadsheetApp.getUi();
+    
+    const templates = {
+      TUF: DocumentApp.openById(ONLINER_CONFIG.TEMPLATES.TUF),
+      INOTE: DocumentApp.openById(ONLINER_CONFIG.TEMPLATES.INOTE)
+    };
+    
+    const folder = DriveApp.getFolderById(ONLINER_CONFIG.FOLDERS.TEMP);
+    const today = Utilities.formatDate(new Date(), 'GMT+03', 'dd.MM.yyyy');
+    const fileName = `Документы ${today}`;
+    
+    const { file: mergedFile, doc: mergedDoc } = copyAndProcessTemplate(
+      ONLINER_CONFIG.TEMPLATES.INOTE,
+      ONLINER_CONFIG.FOLDERS.TEMP,
+      fileName
+    );
+    
+    const body = mergedDoc.getBody();
+    body.clear();
+    
+    const sheet = SpreadsheetApp.getActiveSheet();
+    const selectedRange = sheet.getActiveRange();
+    
+    if (!selectedRange) {
+      ui.alert('Ошибка', 'Не выделен диапазон данных.', ui.ButtonSet.OK);
+      return;
+    }
+    
+    const rows = selectedRange.getValues();
+    const modelsSummary = [];
+    
+    rows.forEach((row, index) => {
+      const isTufSource = String(row[ONLINER_CONFIG.SHEET_COLUMNS.SOURCE] || '')
+        .toLowerCase()
+        .includes('tuf');
+      
+      const templateDoc = isTufSource ? templates.TUF : templates.INOTE;
+      const templateBody = templateDoc.getBody();
+      
+      const startIndex = body.getNumChildren();
+      
+      for (let i = 0; i < templateBody.getNumChildren(); i++) {
+        const element = templateBody.getChild(i).copy();
+        const elementType = element.getType();
+        
+        switch (elementType) {
+          case DocumentApp.ElementType.PARAGRAPH:
+            body.appendParagraph(element.asParagraph());
+            break;
+
+          case DocumentApp.ElementType.TABLE:
+            body.appendTable(element.asTable());
+            break;
+
+          case DocumentApp.ElementType.INLINE_IMAGE:
+            body.appendImage(element.asInlineImage());
+            break;
+
+          case DocumentApp.ElementType.LIST_ITEM:
+            body.appendListItem(element.asListItem());
+            break;
+
+          default:
+            // ⚠️ безопасный fallback
+            body.appendParagraph(element.getText ? element.getText() : '');
+        }
+      }
+      
+      const endIndex = body.getNumChildren() - 1;
+      
+      const dateValue = row[ONLINER_CONFIG.SHEET_COLUMNS.DATE_DELIVERY];
+      const deliveryDate = dateValue instanceof Date
+        ? Utilities.formatDate(dateValue, 'GMT+03', 'dd.MM.yyyy')
+        : dateValue;
+      
+      // УМНАЯ ПОДСТАНОВКА ГАРАНТИИ С ПРАВИЛЬНЫМ СКЛОНЕНИЕМ
+      const acValue = parseInt(row[ONLINER_CONFIG.SHEET_COLUMNS.WARRANTY_BASE], 10);
+      const aiValue = parseInt(row[ONLINER_CONFIG.SHEET_COLUMNS.WARRANTY_FULL], 10);
+
+      let warrantyText = '';
+
+      function plural(m) {
+        return pluralizeMonths(m);
+      }
+
+      function buildFromAC(value) {
+        if (isNaN(value) || value <= 0) {
+          return null;
+        }
+
+        if (value < 36) {
+          const serviceMonths = 36 - value;
+          return `${value} ${plural(value)} + ${serviceMonths} ${plural(serviceMonths)} сервисного обслуживания`;
+        }
+
+        return `${value} ${plural(value)}`;
+      }
+
+      function buildFromAI(value) {
+        if (isNaN(value) || value <= 0) {
+          return null;
+        }
+
+        const base = 12;
+        const serviceMonths = Math.max(value - base, 0);
+
+        return serviceMonths > 0
+          ? `${base} ${plural(base)} + ${serviceMonths} ${plural(serviceMonths)} сервисного обслуживания`
+          : `${base} ${plural(base)}`;
+      }
+
+      // 🔥 ПРИОРИТЕТ ЛОГИКИ
+      if (!isNaN(acValue) && acValue > 0) {
+        warrantyText = buildFromAC(acValue);
+      } 
+      else if (!isNaN(aiValue) && aiValue > 0) {
+        warrantyText = buildFromAI(aiValue);
+      } 
+      else {
+        // ❗ вообще ничего не указано
+        warrantyText = `12 ${plural(12)} + 24 ${plural(24)} сервисного обслуживания`;
+      }
+      
+      const replacements = {
+        '{Дата}': deliveryDate,
+        '{Модель}': row[ONLINER_CONFIG.SHEET_COLUMNS.MODEL] || '',
+        '{Цена продажи}': formatBYN(parsePrice(row[ONLINER_CONFIG.SHEET_COLUMNS.SALE_PRICE]), ' '),
+        '{Гарантия}': warrantyText,
+        '{Номер заказа}': row[ONLINER_CONFIG.SHEET_COLUMNS.ORDER_NUMBER] || ''
+      };
+      
+      for (let i = startIndex; i <= endIndex; i++) {
+        replaceInDocumentElement(body.getChild(i), replacements);
+      }
+      
+      const finalPrice = parsePrice(row[ONLINER_CONFIG.SHEET_COLUMNS.FINAL_PRICE]);
+      modelsSummary.push({
+        model: row[ONLINER_CONFIG.SHEET_COLUMNS.MODEL] || '',
+        price: finalPrice,
+        formattedPrice: formatBYN(finalPrice, ' ')
+      });
+      
+      if (index < rows.length - 1) {
+        body.appendPageBreak();
+      }
+    });
+    
+    mergedDoc.saveAndClose();
+    
+    Object.values(templates).forEach(doc => doc.saveAndClose());
+    
+    showPrintResults(mergedDoc.getUrl(), modelsSummary);
+    
+  } catch (error) {
+    const ui = SpreadsheetApp.getUi();
+    ui.alert('Ошибка', `❗ ${error.message}`, ui.ButtonSet.OK);
+    throw error;
+  }
+}
+
+/**
+ * Отображение результатов печати
+ */
+function showPrintResults(documentUrl, modelsSummary) {
+  modelsSummary.sort((a, b) => a.price - b.price);
+  
+  const summaryHtml = `
+    <table style="width:100%; border-collapse: collapse;">
+      ${modelsSummary.map(item => `
+        <tr>
+          <td>${item.model}</td>
+          <td style="text-align:right">
+            <span style="white-space:nowrap">
+              ${item.formattedPrice}
+            </span>
+          </td>
+        </tr>
+      `).join('')}
+    </table>
+  `;
+  
+  const htmlOutput = HtmlService.createHtmlOutput(`
+    <div style="padding: 20px;">
+      <p>✅ Объединённый документ создан</p>
+      <p><a href="${documentUrl}" target="_blank">Открыть документ</a></p>
+      <hr>
+      <h3>Итоговая стоимость товаров:</h3>
+      ${summaryHtml}
+    </div>
+  `)
+  .setWidth(520)
+  .setHeight(360);
+  
+  SpreadsheetApp.getUi().showModalDialog(htmlOutput, 'Готово');
+}
+
+// ===================== ИНТЕГРАЦИЯ С ВНЕШНИМИ СЕРВИСАМИ =====================
+
+/**
+ * Отправка заказов во внешнюю систему (с обработкой ошибок)
+ */
+function sendOrdersToExternalSystem() {
+  try {
+    const fourteenDaysAgo = new Date(Date.now() - 1000 * 60 * 60 * 24 * 14);
+    const sheet = SpreadsheetApp.getActiveSheet();
+    const allData = sheet.getDataRange().getValues();
+    
+    const filteredData = allData.filter(row => {
+      return row[ONLINER_CONFIG.SHEET_COLUMNS.STATUS] &&
+             row[ONLINER_CONFIG.SHEET_COLUMNS.DATE_ORDER] &&
+             row[ONLINER_CONFIG.SHEET_COLUMNS.DATE_SUPPLIER] &&
+             row[ONLINER_CONFIG.SHEET_COLUMNS.DATE_DELIVERY] &&
+             row[ONLINER_CONFIG.SHEET_COLUMNS.DATE_ORDER] > fourteenDaysAgo;
+    });
+    
+    const orders = filteredData.map(row => ({
+      Status: row[ONLINER_CONFIG.SHEET_COLUMNS.STATUS],
+      DateOrder: Utilities.formatDate(row[ONLINER_CONFIG.SHEET_COLUMNS.DATE_ORDER], 'GMT+03', 'MM.dd.yyyy'),
+      DateSupplier: Utilities.formatDate(row[ONLINER_CONFIG.SHEET_COLUMNS.DATE_SUPPLIER], 'GMT+03', 'MM.dd.yyyy'),
+      DateDelivery: Utilities.formatDate(row[ONLINER_CONFIG.SHEET_COLUMNS.DATE_DELIVERY], 'GMT+03', 'MM.dd.yyyy'),
+      NumberOrder: row[ONLINER_CONFIG.SHEET_COLUMNS.ORDER_NUMBER],
+      Category: row[ONLINER_CONFIG.SHEET_COLUMNS.CATEGORY],
+      Product: row[ONLINER_CONFIG.SHEET_COLUMNS.MODEL],
+      PriceSupplier: row[ONLINER_CONFIG.SHEET_COLUMNS.SUPPLIER_PRICE_BYN],
+      PriceOrder: row[ONLINER_CONFIG.SHEET_COLUMNS.SALE_PRICE],
+      PriceDelivery: row[ONLINER_CONFIG.SHEET_COLUMNS.DELIVERY_PRICE],
+      PriceOther: row[ONLINER_CONFIG.SHEET_COLUMNS.OTHER_PRICE],
+      ClientName: row[ONLINER_CONFIG.SHEET_COLUMNS.CLIENT_NAME],
+      ClientPhone: row[ONLINER_CONFIG.SHEET_COLUMNS.CLIENT_PHONE],
+      ClientAddress: row[ONLINER_CONFIG.SHEET_COLUMNS.CLIENT_ADDRESS],
+      SupplierName: row[ONLINER_CONFIG.SHEET_COLUMNS.SUPPLIER],
+      DeliveryType: row[ONLINER_CONFIG.SHEET_COLUMNS.DELIVERY_TYPE],
+      PaymentType: row[ONLINER_CONFIG.SHEET_COLUMNS.PAYMENT_TYPE],
+      PricePaymentDelivery: row[ONLINER_CONFIG.SHEET_COLUMNS.DELIVERY_PAYMENT_PRICE],
+      Comment: row[ONLINER_CONFIG.SHEET_COLUMNS.COMMENT]
+    }));
+    
+    if (orders.length === 0) {
+      SpreadsheetApp.getUi().alert('Информация', 'Нет данных для отправки.', SpreadsheetApp.getUi().ButtonSet.OK);
+      return;
+    }
+    
+    const apiUrl = 'https://b2c-inote.ru/api/order/PostOrderGoogleSheets';
+    const payload = JSON.stringify(orders);
+    
+    const response = UrlFetchApp.fetch(apiUrl, {
+      method: 'POST',
+      contentType: 'application/json',
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/json'
+      },
+      payload: payload,
+      muteHttpExceptions: true
+    });
+    
+    const responseCode = response.getResponseCode();
+    if (responseCode >= 200 && responseCode < 300) {
+      SpreadsheetApp.getUi().alert('Успешно', `Отправлено ${orders.length} заказов.`, SpreadsheetApp.getUi().ButtonSet.OK);
+    } else {
+      throw new Error(`Ошибка API: код ${responseCode}, ответ: ${response.getContentText()}`);
+    }
+    
+  } catch (error) {
+    const ui = SpreadsheetApp.getUi();
+    ui.alert('Ошибка отправки', `❗ ${error.message}`, ui.ButtonSet.OK);
+    Logger.error('Ошибка в sendOrdersToExternalSystem:', error);
+  }
+}
+
+// ===================== ПЕРЕМЕЩЕНИЕ ДАННЫХ МЕЖДУ ТАБЛИЦАМИ =====================
+
+/**
+ * Перенос данных между таблицами (ОПТИМИЗИРОВАННАЯ ВЕРСИЯ)
+ */
+function transferDataBetweenSheets() {
+  try {
+    const sourceSpreadsheet = SpreadsheetApp.openById(ONLINER_CONFIG.SPREADSHEETS.SOURCE);
+    const targetSpreadsheet = SpreadsheetApp.openById(ONLINER_CONFIG.SPREADSHEETS.TARGET);
+    
+    const sourceSheet = sourceSpreadsheet.getSheets()[0];
+    const targetSheet = targetSpreadsheet.getSheets()[0];
+    
+    // Определяем столбцы для переноса
+    const sourceColumns = [4, 5, 17, 18, 22, 23, 24, 25]; // D, E, Q, R, V, W, X, Y
+    
+    // ЧИТАЕМ ВСЕ ДАННЫЕ ОДНИМ ВЫЗОВОМ
+    const lastRow = sourceSheet.getLastRow();
+    if (lastRow <= 1) {
+      SpreadsheetApp.getUi().alert('Информация', 'В исходной таблице нет данных.', SpreadsheetApp.getUi().ButtonSet.OK);
+      return;
+    }
+    
+    // Получаем все данные из нужных колонок за один раз
+    const allData = [];
+    for (let col of sourceColumns) {
+      const columnData = sourceSheet.getRange(2, col, lastRow - 1, 1).getValues();
+      allData.push(columnData);
+    }
+    
+    // Формируем комбинированные строки
+    const combinedData = [];
+    for (let i = 0; i < lastRow - 1; i++) {
+      const row = [];
+      for (let j = 0; j < sourceColumns.length; j++) {
+        row.push(allData[j][i][0]);
+      }
+      combinedData.push(row);
+    }
+    
+    // Очищаем целевую область и записываем данные
+    const targetLastRow = targetSheet.getLastRow();
+    if (targetLastRow > 1) {
+      targetSheet.getRange(2, 1, targetLastRow - 1, sourceColumns.length).clearContent();
+    }
+    
+    if (combinedData.length > 0) {
+      targetSheet.getRange(2, 1, combinedData.length, combinedData[0].length)
+        .setValues(combinedData);
+      
+      SpreadsheetApp.getUi().alert('Успешно', `Перенесено ${combinedData.length} строк.`, SpreadsheetApp.getUi().ButtonSet.OK);
+    }
+    
+  } catch (error) {
+    const ui = SpreadsheetApp.getUi();
+    ui.alert('Ошибка', `Ошибка переноса данных: ${error.message}`, ui.ButtonSet.OK);
+    Logger.error('Ошибка в transferDataBetweenSheets:', error);
+  }
+}
+
+/**
+ * Копирование заказов в лист гарантий
+ */
+function copyOrdersToWarrantySheet() {
+  try {
+    const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+    const sourceSheet = spreadsheet.getSheetByName('Заказы');
+    const targetSheet = spreadsheet.getSheetByName('Гарантии');
+    
+    if (!sourceSheet || !targetSheet) {
+      SpreadsheetApp.getUi().alert('Ошибка', 'Лист "Заказы" или "Гарантии" не найден.', SpreadsheetApp.getUi().ButtonSet.OK);
+      return;
+    }
+    
+    const selectedRange = sourceSheet.getActiveRange();
+    if (!selectedRange) {
+      SpreadsheetApp.getUi().alert('Ошибка', 'Не выделен диапазон данных.', SpreadsheetApp.getUi().ButtonSet.OK);
+      return;
+    }
+    
+    const data = selectedRange.getValues();
+    if (data.length === 0) {
+      SpreadsheetApp.getUi().alert('Информация', 'Нет данных для копирования.', SpreadsheetApp.getUi().ButtonSet.OK);
+      return;
+    }
+    
+    const formattedData = data.map(row => [
+      row[ONLINER_CONFIG.SHEET_COLUMNS.DATE_DELIVERY],
+      row[ONLINER_CONFIG.SHEET_COLUMNS.ORDER_NUMBER],
+      `Категория: ${row[ONLINER_CONFIG.SHEET_COLUMNS.CATEGORY] || ''}
+       Модель: ${row[ONLINER_CONFIG.SHEET_COLUMNS.MODEL] || ''}
+       Цена: ${row[ONLINER_CONFIG.SHEET_COLUMNS.SALE_PRICE] || ''}`.trim(),
+      row[ONLINER_CONFIG.SHEET_COLUMNS.SUPPLIER],
+      `ФИО: ${row[ONLINER_CONFIG.SHEET_COLUMNS.CLIENT_NAME] || ''}
+       Тел.: ${row[ONLINER_CONFIG.SHEET_COLUMNS.CLIENT_PHONE] || ''}
+       Адрес: ${row[ONLINER_CONFIG.SHEET_COLUMNS.CLIENT_ADDRESS] || ''}`.trim()
+    ]);
+    
+    const lastRow = targetSheet.getLastRow() + 1;
+    targetSheet.getRange(lastRow, 2, formattedData.length, formattedData[0].length)
+      .setValues(formattedData);
+    
+    SpreadsheetApp.getUi().alert('Успешно', `Скопировано ${formattedData.length} строк в гарантии.`, SpreadsheetApp.getUi().ButtonSet.OK);
+    
+  } catch (error) {
+    const ui = SpreadsheetApp.getUi();
+    ui.alert('Ошибка', `Ошибка копирования: ${error.message}`, ui.ButtonSet.OK);
+    Logger.error('Ошибка в copyOrdersToWarrantySheet:', error);
+  }
+}
+
+// ===================== ВИЗУАЛИЗАЦИЯ ДАННЫХ =====================
+
+/**
+ * Отображение информации о выбранных заказах (С ДАТОЙ ДОСТАВКИ И КАТЕГОРИЕЙ)
+ */
+function showSelectedOrdersInfo() {
+  try {
+    const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Заказы');
+    const ui = SpreadsheetApp.getUi();
+    
+    const selectedRange = sheet.getActiveRange();
+    if (!selectedRange) {
+      ui.alert('❌ Нет выделения');
+      return;
+    }
+    
+    const startRow = selectedRange.getRow();
+    const rowCount = selectedRange.getNumRows();
+    
+    const allData = sheet.getDataRange().getValues();
+    const ordersMap = {};
+    
+    for (let i = startRow - 1; i < startRow - 1 + rowCount; i++) {
+      const row = allData[i];
+      
+      const phone = normalizePhone(row[ONLINER_CONFIG.SHEET_COLUMNS.CLIENT_PHONE]);
+      if (!phone) continue;
+      
+      // Форматируем дату доставки
+      const dateValue = row[ONLINER_CONFIG.SHEET_COLUMNS.DATE_DELIVERY];
+      const deliveryDate = dateValue instanceof Date
+        ? Utilities.formatDate(dateValue, 'GMT+03', 'dd.MM.yyyy')
+        : dateValue;
+      
+      const orderInfo = {
+        category: String(row[ONLINER_CONFIG.SHEET_COLUMNS.CATEGORY] || '').trim(), // Столбец J
+        model: String(row[ONLINER_CONFIG.SHEET_COLUMNS.MODEL] || '').trim(),
+        price: parsePrice(row[ONLINER_CONFIG.SHEET_COLUMNS.FINAL_PRICE]),
+        address: String(row[ONLINER_CONFIG.SHEET_COLUMNS.CLIENT_ADDRESS] || '').trim(),
+        payment: String(row[ONLINER_CONFIG.SHEET_COLUMNS.PAYMENT_TYPE] || '').trim(),
+        deliveryDate: deliveryDate || ''
+      };
+      
+      if (!ordersMap[phone]) {
+        ordersMap[phone] = {
+          categories: orderInfo.category ? [orderInfo.category] : [],
+          models: [orderInfo.model],
+          totalPrice: orderInfo.price,
+          address: orderInfo.address,
+          phone: phone,
+          payments: orderInfo.payment ? [orderInfo.payment] : [],
+          deliveryDate: orderInfo.deliveryDate
+        };
+      } else {
+        // Добавляем категорию, если её ещё нет в списке для этого клиента
+        if (orderInfo.category && !ordersMap[phone].categories.includes(orderInfo.category)) {
+          ordersMap[phone].categories.push(orderInfo.category);
+        }
+        
+        ordersMap[phone].models.push(orderInfo.model);
+        ordersMap[phone].totalPrice += orderInfo.price;
+        
+        if (orderInfo.payment && !ordersMap[phone].payments.includes(orderInfo.payment)) {
+          ordersMap[phone].payments.push(orderInfo.payment);
+        }
+        
+        if (orderInfo.deliveryDate && !ordersMap[phone].deliveryDate) {
+          ordersMap[phone].deliveryDate = orderInfo.deliveryDate;
+        }
+      }
+    }
+    
+    if (Object.keys(ordersMap).length === 0) {
+      ui.alert('❌ Нет данных');
+      return;
+    }
+    
+    showOrdersInfoDialog(ordersMap);
+    
+  } catch (error) {
+    const ui = SpreadsheetApp.getUi();
+    ui.alert('Ошибка', `Ошибка отображения заказов: ${error.message}`, ui.ButtonSet.OK);
+    Logger.error('Ошибка в showSelectedOrdersInfo:', error);
+  }
+}
+
+/**
+ * Диалог с информацией о заказах (С КАТЕГОРИЕЙ)
+ */
+function showOrdersInfoDialog(ordersMap) {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Заказы');
+  const selectedRange = sheet.getActiveRange();
+  const startRow = selectedRange.getRow();
+
+  const orders = Object.values(ordersMap);
+
+  const rowsHtml = orders.map((order, index) => `
+    <tr>
+      <td>${order.deliveryDate || ''}</td>
+      <td>${order.categories.join(', ')}</td>
+      <td>${order.models.join(' + ')}</td>
+      <td class="price">${formatBYN(order.totalPrice)}</td>
+      <td>${order.address}</td>
+      <td>${order.phone}</td>
+      <td>
+        <input 
+          type="number" 
+          step="0.01" 
+          min="0"
+          class="delivery-input"
+          data-row="${startRow + index}"
+          required
+        />
+      </td>
+    </tr>
+  `).join('');
+
+  const html = HtmlService.createHtmlOutput(`
+    <style>
+      body {
+        font-family: Arial;
+        padding:20px;
+      }
+
+      table {
+        border-collapse: collapse;
+        width:100%;
+      }
+
+      th, td {
+        border:1px solid #ddd;
+        padding:10px;
+        vertical-align: top;
+        white-space: normal;
+        word-break: break-word;
+      }
+
+      th {
+        background:#f5f5f5;
+        font-weight:600;
+      }
+
+      td.price {
+        white-space: nowrap;
+        font-weight: bold;
+      }
+
+      input {
+        width: 110px;
+        padding:4px;
+        font-size:14px;
+      }
+
+      .footer {
+        margin-top:20px;
+        text-align:right;
+      }
+
+      button {
+        padding:10px 18px;
+        font-weight:bold;
+        cursor:pointer;
+      }
+
+      .error {
+        color:red;
+        margin-top:10px;
+        display:none;
+        font-weight:600;
+      }
+    </style>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Дата</th>
+          <th>Категория</th>
+          <th>Модель</th>
+          <th>Сумма</th>
+          <th>Адрес</th>
+          <th>Телефон</th>
+          <th>Оплата доставки BYN</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${rowsHtml}
+      </tbody>
+    </table>
+
+    <div class="error" id="error">
+      ⚠️ Заполните все поля доставки!
+    </div>
+
+    <div class="footer">
+      <button onclick="save()">Сохранить и выйти</button>
+    </div>
+
+    <script>
+      function save() {
+        const inputs = document.querySelectorAll('.delivery-input');
+        const data = [];
+
+        for (let input of inputs) {
+          if (!input.value) {
+            document.getElementById('error').style.display = 'block';
+            return;
+          }
+
+          data.push({
+            row: parseInt(input.dataset.row),
+            value: input.value.replace('.', ',')
+          });
+        }
+
+        google.script.run
+          .withSuccessHandler(() => {
+            google.script.host.close();
+          })
+          .saveDeliveryPayments(data);
+      }
+
+      google.script.host.setHeight(750);
+      google.script.host.setWidth(1400);
+
+      window.onbeforeunload = function() {
+        return "Сначала заполните доставку!";
+      };
+    </script>
+  `)
+  .setWidth(1700)
+  .setHeight(800);
+
+  SpreadsheetApp.getUi().showModalDialog(html, 'Информация о заказах');
+}
+
+
+function saveDeliveryPayments(data) {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Заказы');
+
+  data.forEach(item => {
+    sheet.getRange(item.row, 25).setValue(item.value); 
+    // 25 = столбец Y
+  });
+}
+
+
+function writeColumnsSafe(sheet, startRow, columnMap) {
+  const rowsNeeded = Object.values(columnMap)[0].length;
+  const lastRow = sheet.getLastRow();
+
+  if (startRow + rowsNeeded - 1 > lastRow) {
+    sheet.insertRowsAfter(lastRow, startRow + rowsNeeded - 1 - lastRow);
+  }
+
+  Object.entries(columnMap).forEach(([col, values]) => {
+    sheet
+      .getRange(startRow, Number(col), values.length, 1)
+      .setValues(values);
+  });
+}
+
+// ===================== МЕНЮ НАСТРОЙКА =====================
+
+function generalMenu(ui) {
+  ui.createMenu('Onliner')
+    .addItem('📥 Получить заказ TUF (курсор)', 'menuGetOrderTuf')
+    .addItem('📥 Получить заказ Inote (курсор)', 'menuGetOrderInote')
+    .addSeparator()
+    .addItem('🔄 Автоподбор (TUF → Inote)', 'runWithFallback')
+    .addSeparator()
+    .addItem('🖨️ Создать документы', 'createPrintDocuments')
+    .addItem('📊 Инфо о выбранных', 'showSelectedOrdersInfo')
+    .addSeparator()
+    .addItem('📄 Перенести данные', 'transferDataBetweenSheets')
+    .addItem('📋 Копировать в гарантии', 'copyOrdersToWarrantySheet')
+    .addToUi();
+}
+
+function onOpen(){
+  const ui = SpreadsheetApp.getUi();
+  generalMenu(ui);
+  bot(ui);
+}
