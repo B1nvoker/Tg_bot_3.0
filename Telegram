@@ -12,6 +12,7 @@ let COL_IDX = {};
 const CONFIG = {
   TOKEN: '8230908280:AAEaky2wog0lVM62qtcsaFcFXU-yipweAZA',
   CHAT_ID: '-1003283469910',   //тест - -1003570835806, релиз - -1003283469910
+  CHAT_ID_PERSONAL: '2035315338',
   DEBUG: false,
   
   SPREADSHEET_ID: '1ixHPQRRYuLbeU1nCpFsRAILHZUn8rfqx4_LVQ-GL-hA',
@@ -31,6 +32,7 @@ const CONFIG = {
   // 🔥 ОБНОВЛЕННЫЕ НАЗВАНИЯ СТОЛБЦОВ (согласно вашему списку)
   COLUMN_NAMES: {
     DATE: 'Дата поставки',              // Используем дату доставки для фильтрации "на сегодня"
+    DATE_ORDERS: 'Дата отгрузки',
     ORDER_NUM: 'Номер заказа',
     COMMENT: 'Примечания к заказу',
     DELIVERY: 'Способ доставки',
@@ -59,6 +61,12 @@ const CONFIG = {
   SEND_MODE: {
     QUEUE: 'queue',
     FAST: 'fast'
+  },
+
+  ONLINER_PRINT: {
+    TEMPLATE_TUF_ID: '',
+    TEMPLATE_INOTE_ID: '',
+    OUTPUT_FOLDER_ID: ''
   }
 };
 
@@ -235,6 +243,7 @@ function bot(ui) {
     .addToUi();
   setBotCommands();
   ensureQueueTrigger();
+  sendPrintDocumentsOnBotStart();
 }
 
 // 🔥 ОЧИСТКА КЭША КОЛОНОК
@@ -973,12 +982,333 @@ function parsePrice(text) {
   return Number(clean) || 0;
 }
 
+const ONLINER_PRINT_COLUMNS = {
+  DATE_DELIVERY: 3,
+  ORDER_NUMBER: 4,
+  SOURCE: 8,
+  MODEL: 11,
+  SALE_PRICE: 19,
+  WARRANTY_BASE: 28,
+  WARRANTY_FULL: 34
+};
+
 function normalizeSupplierName(name) {
   if (!name && name !== 0) return '';
   return String(name).trim().toLowerCase().replace(/\s+/g, '').replace(/[^0-9a-zа-яё]/gi, '');
 }
 
 function getToday() { return Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'dd.MM.yyyy'); }
+
+function getRowDateString(value) {
+  if (value instanceof Date) {
+    return Utilities.formatDate(value, Session.getScriptTimeZone(), 'dd.MM.yyyy');
+  }
+
+  const dateStr = String(value || '').trim();
+  const dateMatch = dateStr.match(/(\d{1,2})[\.\/\-](\d{1,2})[\.\/\-](\d{4})/);
+  if (!dateMatch) return dateStr;
+
+  const [_, day, month, year] = dateMatch;
+  return `${String(day).padStart(2, '0')}.${String(month).padStart(2, '0')}.${year}`;
+}
+
+function getOrdersDateColumnIndex() {
+  if (typeof COL_IDX.DATE_ORDERS === 'number') return COL_IDX.DATE_ORDERS;
+  return COL_IDX.DATE;
+}
+
+function getTodayOrderRows() {
+  initColumns();
+
+  const ordersSheet = SpreadsheetApp
+    .openById(CONFIG.SPREADSHEET_ID)
+    .getSheetByName(CONFIG.SHEETS.ORDERS);
+
+  if (!ordersSheet) {
+    throw new Error('Не найдена таблица "Заказы"');
+  }
+
+  const lastRow = ordersSheet.getLastRow();
+  if (lastRow < 3) return [];
+
+  const lastColumn = ordersSheet.getLastColumn();
+  const data = ordersSheet.getRange(3, 1, lastRow - 2, lastColumn).getValues();
+  const today = getToday();
+  const dateColumnIdx = getOrdersDateColumnIndex();
+
+  const rows = [];
+  data.forEach((row, i) => {
+    const rowDateStr = getRowDateString(row[dateColumnIdx]);
+    if (rowDateStr !== today) return;
+
+    const orderNum = row[COL_IDX.ORDER_NUM];
+    const model = row[COL_IDX.MODEL];
+    if (!orderNum && !model) return;
+
+    rows.push({
+      rowIndex: i + 3,
+      row
+    });
+  });
+
+  return rows;
+}
+
+function formatByrAmount(value, separator = ' ') {
+  const amount = typeof value === 'string' ? parsePrice(value) : Number(value);
+  if (isNaN(amount) || amount == null) return '';
+
+  const [integer, decimal] = Math.abs(amount).toFixed(2).split('.');
+  const sign = amount < 0 ? '-' : '';
+
+  const formattedInteger = integer
+    .split('')
+    .reverse()
+    .join('')
+    .replace(/(\d{3})(?=\d)/g, `$1${separator}`)
+    .split('')
+    .reverse()
+    .join('');
+
+  return `${sign}${formattedInteger},${decimal}`;
+}
+
+function pluralizeMonthsForWarranty(n) {
+  if (n % 10 === 1 && n % 100 !== 11) return 'месяц';
+  if ([2, 3, 4].includes(n % 10) && ![12, 13, 14].includes(n % 100)) return 'месяца';
+  return 'месяцев';
+}
+
+function replaceInDocumentElement(element, replacements) {
+  const elementType = element.getType();
+
+  if (elementType === DocumentApp.ElementType.PARAGRAPH) {
+    const paragraph = element.asParagraph();
+    Object.keys(replacements).forEach(key => {
+      const pattern = key.replace(/[{}]/g, '\\$&');
+      paragraph.replaceText(pattern, String(replacements[key]));
+    });
+    return;
+  }
+
+  if (elementType === DocumentApp.ElementType.TABLE) {
+    const table = element.asTable();
+    for (let row = 0; row < table.getNumRows(); row++) {
+      const tableRow = table.getRow(row);
+      for (let cell = 0; cell < tableRow.getNumCells(); cell++) {
+        const tableCell = tableRow.getCell(cell);
+        for (let i = 0; i < tableCell.getNumChildren(); i++) {
+          const child = tableCell.getChild(i);
+          if (child.getType() === DocumentApp.ElementType.PARAGRAPH) {
+            replaceInDocumentElement(child, replacements);
+          }
+        }
+      }
+    }
+  }
+}
+
+function copyAndProcessTemplate(templateId, folderId, fileName) {
+  const templateFile = DriveApp.getFileById(templateId);
+  const targetFolder = DriveApp.getFolderById(folderId);
+  const copiedFile = templateFile.makeCopy(fileName, targetFolder);
+  const copiedDoc = DocumentApp.openById(copiedFile.getId());
+  return { file: copiedFile, doc: copiedDoc, folder: targetFolder };
+}
+
+function buildWarrantyText(acValue, aiValue) {
+  function buildFromAC(value) {
+    if (isNaN(value) || value <= 0) return null;
+    if (value < 36) {
+      const serviceMonths = 36 - value;
+      return `${value} ${pluralizeMonthsForWarranty(value)} + ${serviceMonths} ${pluralizeMonthsForWarranty(serviceMonths)} сервисного обслуживания`;
+    }
+    return `${value} ${pluralizeMonthsForWarranty(value)}`;
+  }
+
+  function buildFromAI(value) {
+    if (isNaN(value) || value <= 0) return null;
+    const base = 12;
+    const serviceMonths = Math.max(value - base, 0);
+    return serviceMonths > 0
+      ? `${base} ${pluralizeMonthsForWarranty(base)} + ${serviceMonths} ${pluralizeMonthsForWarranty(serviceMonths)} сервисного обслуживания`
+      : `${base} ${pluralizeMonthsForWarranty(base)}`;
+  }
+
+  if (!isNaN(acValue) && acValue > 0) return buildFromAC(acValue);
+  if (!isNaN(aiValue) && aiValue > 0) return buildFromAI(aiValue);
+  return `12 ${pluralizeMonthsForWarranty(12)} + 24 ${pluralizeMonthsForWarranty(24)} сервисного обслуживания`;
+}
+
+function appendTemplateContent(targetBody, templateBody) {
+  for (let i = 0; i < templateBody.getNumChildren(); i++) {
+    const element = templateBody.getChild(i).copy();
+    const elementType = element.getType();
+
+    switch (elementType) {
+      case DocumentApp.ElementType.PARAGRAPH:
+        targetBody.appendParagraph(element.asParagraph());
+        break;
+      case DocumentApp.ElementType.TABLE:
+        targetBody.appendTable(element.asTable());
+        break;
+      case DocumentApp.ElementType.INLINE_IMAGE:
+        targetBody.appendImage(element.asInlineImage());
+        break;
+      case DocumentApp.ElementType.LIST_ITEM:
+        targetBody.appendListItem(element.asListItem());
+        break;
+      default:
+        targetBody.appendParagraph(element.getText ? element.getText() : '');
+    }
+  }
+}
+
+function createChecksSpreadsheetInFolder(folderId, fileName, modelsSummary) {
+  const spreadsheet = SpreadsheetApp.create(fileName);
+  const file = DriveApp.getFileById(spreadsheet.getId());
+  const folder = DriveApp.getFolderById(folderId);
+  file.moveTo(folder);
+
+  const sheet = spreadsheet.getSheets()[0];
+  sheet.setName('Чеки');
+
+  const rows = [['Модель', 'Цена']];
+  modelsSummary
+    .sort((a, b) => a.price - b.price)
+    .forEach(item => rows.push([item.model, item.formattedPrice]));
+
+  sheet.getRange(1, 1, rows.length, 2).setValues(rows);
+  sheet.autoResizeColumns(1, 2);
+
+  return spreadsheet;
+}
+
+function buildPrintRowsForToday(baseRows) {
+  const rows = baseRows.map(item => item.row);
+  if (rows.length % 2 === 0) return rows;
+
+  const ordersSheet = SpreadsheetApp
+    .openById(CONFIG.SPREADSHEET_ID)
+    .getSheetByName(CONFIG.SHEETS.ORDERS);
+  const nextRowIndex = baseRows[baseRows.length - 1].rowIndex + 1;
+  if (nextRowIndex > ordersSheet.getLastRow()) {
+    throw new Error('Не удалось добавить следующую строку для четного количества гарантийных талонов');
+  }
+
+  const nextRow = ordersSheet.getRange(nextRowIndex, 1, 1, ordersSheet.getLastColumn()).getValues()[0];
+  rows.push(nextRow);
+  return rows;
+}
+
+function mapRowToCheckSummary(row) {
+  const price = parsePrice(row[ONLINER_PRINT_COLUMNS.SALE_PRICE]);
+  return {
+    model: row[ONLINER_PRINT_COLUMNS.MODEL] || '',
+    price,
+    formattedPrice: formatByrAmount(price, ' ')
+  };
+}
+
+function createPrintDocumentsForBot(baseRows = null) {
+  if (!CONFIG.CHAT_ID_PERSONAL) {
+    throw new Error('CONFIG.CHAT_ID_PERSONAL не задан');
+  }
+
+  const { TEMPLATE_TUF_ID, TEMPLATE_INOTE_ID, OUTPUT_FOLDER_ID } = CONFIG.ONLINER_PRINT;
+  if (!TEMPLATE_TUF_ID || !TEMPLATE_INOTE_ID || !OUTPUT_FOLDER_ID) {
+    throw new Error('Не заполнены CONFIG.ONLINER_PRINT.*');
+  }
+
+  const todayRows = Array.isArray(baseRows) ? baseRows : getTodayOrderRows();
+  if (!todayRows.length) {
+    throw new Error('Нет заказов на сегодня для формирования гарантийных талонов.');
+  }
+
+  const warrantyRows = buildPrintRowsForToday(todayRows);
+  const checksRows = todayRows.map(item => item.row);
+
+  const today = Utilities.formatDate(new Date(), 'GMT+03', 'dd.MM.yyyy');
+  const warrantyFileName = `Гарантийные талоны ${today}`;
+  const checksFileName = `${warrantyFileName} чеки`;
+
+  const templates = {
+    TUF: DocumentApp.openById(TEMPLATE_TUF_ID),
+    INOTE: DocumentApp.openById(TEMPLATE_INOTE_ID)
+  };
+
+  const { file: mergedFile, doc: mergedDoc } = copyAndProcessTemplate(
+    TEMPLATE_INOTE_ID,
+    OUTPUT_FOLDER_ID,
+    warrantyFileName
+  );
+
+  const body = mergedDoc.getBody();
+  body.clear();
+  const orderNumbers = [];
+
+  warrantyRows.forEach((row, index) => {
+    const source = String(row[ONLINER_PRINT_COLUMNS.SOURCE] || '').toLowerCase();
+    const isTufSource = source.includes('tuf');
+    const templateBody = (isTufSource ? templates.TUF : templates.INOTE).getBody();
+    const startIndex = body.getNumChildren();
+
+    appendTemplateContent(body, templateBody);
+
+    const endIndex = body.getNumChildren() - 1;
+    const dateValue = row[ONLINER_PRINT_COLUMNS.DATE_DELIVERY];
+    const deliveryDate = dateValue instanceof Date
+      ? Utilities.formatDate(dateValue, 'GMT+03', 'dd.MM.yyyy')
+      : dateValue;
+
+    const acValue = parseInt(row[ONLINER_PRINT_COLUMNS.WARRANTY_BASE], 10);
+    const aiValue = parseInt(row[ONLINER_PRINT_COLUMNS.WARRANTY_FULL], 10);
+    const finalPrice = parsePrice(row[ONLINER_PRINT_COLUMNS.SALE_PRICE]);
+    const orderNumber = String(row[ONLINER_PRINT_COLUMNS.ORDER_NUMBER] || '').trim();
+
+    if (orderNumber) orderNumbers.push(orderNumber);
+
+    const replacements = {
+      '{Дата}': deliveryDate || '',
+      '{Модель}': row[ONLINER_PRINT_COLUMNS.MODEL] || '',
+      '{Цена продажи}': formatByrAmount(finalPrice, ' '),
+      '{Гарантия}': buildWarrantyText(acValue, aiValue),
+      '{Номер заказа}': orderNumber
+    };
+
+    for (let i = startIndex; i <= endIndex; i++) {
+      replaceInDocumentElement(body.getChild(i), replacements);
+    }
+
+    if (index < warrantyRows.length - 1) body.appendPageBreak();
+  });
+
+  mergedDoc.saveAndClose();
+  Object.values(templates).forEach(doc => doc.saveAndClose());
+
+  const modelsSummary = checksRows.map(mapRowToCheckSummary);
+  const checksSpreadsheet = createChecksSpreadsheetInFolder(
+    OUTPUT_FOLDER_ID,
+    checksFileName,
+    modelsSummary
+  );
+
+  if (orderNumbers.length) {
+    const ordersText = `📋 Номера заказов:\n${orderNumbers.map((num, idx) => `${idx + 1}. ${num}`).join('\n')}`;
+    sendMessage(ordersText, null, CONFIG.CHAT_ID_PERSONAL, CONFIG.SEND_MODE.FAST, null, { markdown: false });
+  }
+
+  sendMessage(`Гарантийные талоны\n${mergedFile.getUrl()}`, null, CONFIG.CHAT_ID_PERSONAL, CONFIG.SEND_MODE.FAST, null, { markdown: false });
+  sendMessage(`Чеки\n${checksSpreadsheet.getUrl()}`, null, CONFIG.CHAT_ID_PERSONAL, CONFIG.SEND_MODE.FAST, null, { markdown: false });
+}
+
+function sendPrintDocumentsOnBotStart() {
+  try {
+    createPrintDocumentsForBot();
+  } catch (error) {
+    console.warn('⚠️ Документы при запуске не отправлены:', error.message);
+  }
+}
 
 function cleanAddress(addr) {
   return String(addr || '').replace(/\(.*?\)/g, '').replace(/\s+/g, ' ').replace(/[,;]+/g, ',').trim();
@@ -1008,22 +1338,7 @@ function logTechnoBayForTodayOnce() {
     
     data.forEach((row, i) => {
       // Проверка даты
-      const d = row[COL_IDX.DATE];
-      let rowDateStr = '';
-      
-      if (d instanceof Date) {
-        rowDateStr = Utilities.formatDate(d, Session.getScriptTimeZone(), 'dd.MM.yyyy');
-      } else {
-        const dateStr = String(d || '').trim();
-        const dateMatch = dateStr.match(/(\d{1,2})[\.\/\-](\d{1,2})[\.\/\-](\d{4})/);
-        if (dateMatch) {
-          const [_, day, month, year] = dateMatch;
-          rowDateStr = `${String(day).padStart(2, '0')}.${String(month).padStart(2, '0')}.${year}`;
-        } else {
-          rowDateStr = dateStr;
-        }
-      }
-      
+      const rowDateStr = getRowDateString(row[getOrdersDateColumnIndex()]);
       if (rowDateStr !== todayStr) return;
       
       // Проверка поставщика
@@ -1082,22 +1397,7 @@ function collectSuppliersForToday() {
     const supplierGroups = {};
 
     data.forEach((row, i) => {
-      const d = row[COL_IDX.DATE];
-      let rowDateStr = '';
-      
-      if (d instanceof Date) {
-        rowDateStr = Utilities.formatDate(d, Session.getScriptTimeZone(), 'dd.MM.yyyy');
-      } else {
-        const dateStr = String(d || '').trim();
-        const dateMatch = dateStr.match(/(\d{1,2})[\.\/\-](\d{1,2})[\.\/\-](\d{4})/);
-        if (dateMatch) {
-          const [_, day, month, year] = dateMatch;
-          rowDateStr = `${String(day).padStart(2, '0')}.${String(month).padStart(2, '0')}.${year}`;
-        } else {
-          rowDateStr = dateStr;
-        }
-      }
-
+      const rowDateStr = getRowDateString(row[getOrdersDateColumnIndex()]);
       if (rowDateStr !== todayStr) return;
       
       const supName = String(row[COL_IDX.SUPPLIER]).trim();
@@ -1199,7 +1499,7 @@ function sendOrdersToTelegram() {
       // 🔥 2. КЭШИРУЕМ ДАННЫЕ ПОСТАВЩИКОВ (ИСПРАВЛЕННЫЙ КОД)
       const { supInfo } = getSuppliersData(); 
 
-    // 1. ✅ Заказы — ТОЛЬКО выделенные
+    // 1. ✅ Заказы — ВСЕ за сегодня по колонке "Дата отгрузки"
     const ordersSheet = SpreadsheetApp
       .openById(CONFIG.SPREADSHEET_ID)
       .getSheetByName(CONFIG.SHEETS.ORDERS);
@@ -1209,113 +1509,13 @@ function sendOrdersToTelegram() {
       return;
     }
     
-    // 🔥 ЖЕЛЕЗОБЕТОННОЕ ИСПРАВЛЕНИЕ: множественное выделение с fallback
-    const ss = SpreadsheetApp.getActive();
-    const selection = ss.getSelection();
-    
-    let ranges = [];
-    
-    // 1️⃣ Пробуем получить множественное выделение
-    const rangeList = selection?.getActiveRangeList();
-    if (rangeList && rangeList.getRanges().length) {
-      ranges = rangeList.getRanges();
-      console.log(`📌 Получили RangeList: ${ranges.length} диапазонов`);
-    }
-    
-    // 2️⃣ Fallback — меню "съело" выделение
-    if (!ranges.length) {
-      const activeRange = selection?.getActiveRange();
-      if (activeRange) {
-        ranges = [activeRange];
-        console.log(`📌 Fallback: получили ActiveRange: ${activeRange.getA1Notation()}`);
-      }
-    }
-    
-    // 3️⃣ Если вообще ничего
-    if (!ranges.length) {
-      sendMessage(
-        '❌ Выделение не найдено.\n\n' +
-        'Инструкция:\n' +
-        '1. Выдели строки с заказами (начиная с 3-й строки)\n' +
-        '2. Нажми меню "Бот" → "Запустить выбранные заказы"\n' +
-        '3. Не кликай никуда после выделения!',
-        null,
-        CONFIG.CHAT_ID
-      );
-      return;
-    }
-    
-    console.log(`✅ Найдено диапазонов: ${ranges.length}`);
-    ranges.forEach((r, i) => {
-      console.log(`  Диапазон ${i + 1}: ${r.getA1Notation()}, строк: ${r.getNumRows()}`);
-    });
-    
-    // Берём ТОЛЬКО реальные выделенные диапазоны
-    const rows = [];
-    const HEADER_ROWS = 2;
-    
-    ranges.forEach((r, rangeIndex) => {
-      const startRow = r.getRow();
-      const numRows = r.getNumRows();
-      
-      console.log(`📊 Обрабатываем диапазон ${rangeIndex + 1}: строка ${startRow}, строк ${numRows}`);
-      
-      if (startRow <= HEADER_ROWS && startRow + numRows - 1 <= HEADER_ROWS) {
-        console.log(`⏩ Пропускаем диапазон ${rangeIndex + 1} - только заголовки`);
-        return;
-      }
-      
-      // 🔥 Берем данные с правильным количеством колонок
-      const lastColumn = ordersSheet.getLastColumn();
-      const dataRange = ordersSheet.getRange(startRow, 1, numRows, lastColumn);
-      const data = dataRange.getValues();
-      
-      data.forEach((row, i) => {
-        const realRow = startRow + i;
-        
-        if (realRow <= HEADER_ROWS) {
-          console.log(`⏩ Пропускаем строку ${realRow} - заголовок`);
-          return;
-        }
-        
-        // 🔥 ИСПОЛЬЗУЕМ ДИНАМИЧЕСКИЕ ИНДЕКСЫ
-        const orderNum = row[COL_IDX.ORDER_NUM];
-        const model = row[COL_IDX.MODEL];
-        
-        if (!orderNum && !model) {
-          const supplier = row[COL_IDX.SUPPLIER];
-          const client = row[COL_IDX.CLIENT];
-          const address = row[COL_IDX.ADDRESS];
-          
-          if (!supplier && !client && !address) {
-            console.log(`⏩ Пропускаем строку ${realRow} - пустые данные`);
-            return;
-          }
-        }
-        
-        rows.push({
-          rowIndex: realRow,
-          row: row
-        });
-        
-        console.log(`✅ Добавлена строка ${realRow}: заказ "${orderNum}", модель "${model}"`);
-      });
-    });
+    const rows = getTodayOrderRows();
     
     console.log(`📈 Всего найдено строк: ${rows.length}`);
     
     if (!rows.length) {
       sendMessage(
-        '❌ В выделении нет строк с заказами\n\n' +
-        'Возможные причины:\n' +
-        '1. Выделены только заголовки (первые 2 строки)\n' +
-        '2. Выделены пустые строки\n' +
-        '3. Неверная вкладка - выделение не в таблице "Заказы"\n' +
-        '4. Нет данных в колонках "Номер заказа" или "Модель"\n\n' +
-        'Что делать:\n' +
-        '1. Перейди на вкладку "Заказы"\n' +
-        '2. Выдели реальные заказы (начиная с 31 строки)\n' +
-        '3. Запусти снова',
+        'ℹ️ На сегодня нет заказов в колонке "Дата отгрузки".',
         null, CONFIG.CHAT_ID
       );
       return;
