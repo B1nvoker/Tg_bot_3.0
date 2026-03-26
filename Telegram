@@ -1108,9 +1108,14 @@ function getToday() {
   return Utilities.formatDate(new Date(), tz, 'dd.MM.yyyy');
 }
 
+function formatDateLocal(date) {
+  const tz = CONFIG.TIMEZONE || Session.getScriptTimeZone();
+  return Utilities.formatDate(date, tz, 'dd.MM.yyyy');
+}
+
 function getRowDateString(value) {
   if (value instanceof Date) {
-    return Utilities.formatDate(value, Session.getScriptTimeZone(), 'dd.MM.yyyy');
+    return formatDateLocal(value);
   }
 
   const dateStr = String(value || '').trim();
@@ -1551,7 +1556,7 @@ function collectExtraTasksBySupplier() {
   data.forEach((r, i) => {
     const [date, art, sup, sum, cur, todo] = r;
     if (!(date instanceof Date)) return;
-    if (Utilities.formatDate(date, Session.getScriptTimeZone(), 'dd.MM.yyyy') !== today) return;
+    if (formatDateLocal(date) !== today) return;
     
     const supNorm = sup ? normalizeSupplierName(sup) : '__NO_SUPPLIER__';
     const uid = `ex_${Utilities.getUuid().slice(0, 8)}`;
@@ -2087,7 +2092,7 @@ function editMessageFull(chatId, messageId, text, keyboard = null, useMarkdown =
 
 function reconcileVamExpress(realSum, userName = 'Система') { 
   try {
-    const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+    const ss = getSpreadsheet();
     
     // 🔥 ЗАЩИТА: проверяем OCR суммы
     const ocrSums = ss.getSheetByName(CONFIG.SHEETS.OCR_SUMS).getDataRange().getValues().slice(1)
@@ -2109,6 +2114,8 @@ function reconcileVamExpress(realSum, userName = 'Система') {
     const extraData = extraSheet.getDataRange().getValues().slice(1);
     
     let matchedOrders = [], matchedSum = 0;
+    const rowsToDelete = [];
+    const ordersToUpdate = [];
     
     for (let i = extraData.length - 1; i >= 0; i--) {
       const orderSum = parsePrice(extraData[i][2]);
@@ -2117,12 +2124,35 @@ function reconcileVamExpress(realSum, userName = 'Система') {
       
       const idx = ocrSums.findIndex(s => Math.abs(s - sumToGive) < 0.06);
       if (idx !== -1) { 
-        matchedOrders.push(String(extraData[i][0] || '').trim()); 
+        const orderNum = String(extraData[i][0] || '').trim();
+        matchedOrders.push(orderNum); 
         matchedSum += sumToGive; 
-        extraSheet.deleteRow(i + 2); 
-        updateStatusByOrderNum(extraData[i][0], 'Продан'); 
+        rowsToDelete.push(i + 2);
+        ordersToUpdate.push(orderNum);
         ocrSums.splice(idx, 1); 
       }
+    }
+
+    // Обновляем статусы заказов после расчета
+    ordersToUpdate.forEach(orderNum => updateStatusByOrderNum(orderNum, 'Продан'));
+
+    // Удаляем строки пакетно (снизу вверх, сгруппированные сегменты)
+    if (rowsToDelete.length > 0) {
+      const sortedDesc = rowsToDelete.sort((a, b) => b - a);
+      let segmentMax = sortedDesc[0];
+      let segmentMin = sortedDesc[0];
+
+      for (let i = 1; i < sortedDesc.length; i++) {
+        const row = sortedDesc[i];
+        if (row === segmentMin - 1) {
+          segmentMin = row;
+          continue;
+        }
+        extraSheet.deleteRows(segmentMin, segmentMax - segmentMin + 1);
+        segmentMax = row;
+        segmentMin = row;
+      }
+      extraSheet.deleteRows(segmentMin, segmentMax - segmentMin + 1);
     }
     
     // 🔥 ЗАЩИТА: проверяем matchedOrders перед join
