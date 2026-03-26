@@ -10,10 +10,11 @@ let COL_IDX = {};
 
 // ===================== НАСТРОЙКИ И КОНСТАНТЫ =====================
 const CONFIG = {
-  TOKEN: '8230908280:AAEaky2wog0lVM62qtcsaFcFXU-yipweAZA',
+  TOKEN: scriptProps.getProperty('BOT_TOKEN') || '',
   CHAT_ID: '-1003570835806',   //тест - -1003570835806, релиз - -1003283469910
   CHAT_ID_PERSONAL: '5511276928',   //тест - 5511276928, релиз - 7365653720
   DEBUG: false,
+  TIMEZONE: 'Europe/Minsk',
   
   SPREADSHEET_ID: '1ixHPQRRYuLbeU1nCpFsRAILHZUn8rfqx4_LVQ-GL-hA',
   OCR_FOLDER_ID: '1DXEKv6kDtnPdOQWKW0nLCrWoyaCCFNf_',
@@ -81,6 +82,73 @@ const CACHE_TTL = {
   LONG: 7200,     // 2 часа
   DAY: 86400      // 24 часа
 };
+
+// Локальный кэш объектов Spreadsheet/Sheet в рамках одного выполнения скрипта
+const RUNTIME_CACHE = {
+  spreadsheet: null,
+  sheets: {},
+  todayOrderRows: null
+};
+
+function safeJsonParse(value, fallback = null) {
+  try {
+    return JSON.parse(value);
+  } catch (error) {
+    return fallback;
+  }
+}
+
+function getSpreadsheet() {
+  if (!RUNTIME_CACHE.spreadsheet) {
+    RUNTIME_CACHE.spreadsheet = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  }
+  return RUNTIME_CACHE.spreadsheet;
+}
+
+function getSheet(sheetName) {
+  if (!RUNTIME_CACHE.sheets[sheetName]) {
+    RUNTIME_CACHE.sheets[sheetName] = getSpreadsheet().getSheetByName(sheetName);
+  }
+  return RUNTIME_CACHE.sheets[sheetName];
+}
+
+function clearRuntimeSheetCache(sheetName = null) {
+  if (sheetName) {
+    delete RUNTIME_CACHE.sheets[sheetName];
+    RUNTIME_CACHE.todayOrderRows = null;
+    return;
+  }
+  RUNTIME_CACHE.spreadsheet = null;
+  RUNTIME_CACHE.sheets = {};
+  RUNTIME_CACHE.todayOrderRows = null;
+}
+
+function getReportHeaderMap(force = false) {
+  const cacheKey = 'report_header_map_v1';
+  if (!force) {
+    const cached = CACHE.get(cacheKey);
+    const parsed = cached ? safeJsonParse(cached, null) : null;
+    if (parsed && typeof parsed === 'object') return parsed;
+  }
+
+  const sheet = getSheet(CONFIG.SHEETS.REPORTS);
+  if (!sheet) return null;
+
+  const rawHeaders = sheet.getRange(4, 1, 1, sheet.getLastColumn()).getValues()[0];
+  const headers = rawHeaders.map(h => String(h).replace(/\s+/g, ' ').trim().toLowerCase());
+  const headerMap = {
+    length: rawHeaders.length,
+    idxDate: headers.findIndex(h => h.includes('дата')),
+    idxByn: headers.findIndex(h => h.includes('byn') || h.includes('сумма')),
+    idxUsd: headers.findIndex(h => h.includes('usd') || h.includes('доллар')),
+    idxArt: headers.findIndex(h => h.includes('статья')),
+    idxPurp: headers.findIndex(h => h.includes('платежа')),
+    idxWho: headers.findIndex(h => h.includes('кто') || h.includes('выполнил') || h.includes('исполнитель'))
+  };
+
+  CACHE.put(cacheKey, JSON.stringify(headerMap), CACHE_TTL.MEDIUM);
+  return headerMap;
+}
 
 function TEST_USD_RATE() {
   const rate = getUsdRateCached();
@@ -171,12 +239,15 @@ function initColumns(force = false) {
   
   const cached = CACHE.get("column_indices");
   if (!force && cached) {
-    COL_IDX = JSON.parse(cached);
-    return COL_IDX;
+    const parsed = safeJsonParse(cached, {});
+    if (parsed && typeof parsed === 'object') {
+      COL_IDX = parsed;
+      return COL_IDX;
+    }
   }
   
   try {
-    const sheet = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID).getSheetByName(CONFIG.SHEETS.ORDERS);
+    const sheet = getSheet(CONFIG.SHEETS.ORDERS);
     if (!sheet) throw new Error(`Не найдена таблица "${CONFIG.SHEETS.ORDERS}"`);
     
     // Берем заголовки со 2-й строки
@@ -248,10 +319,12 @@ function bot(ui) {
 
 // 🔥 ОЧИСТКА КЭША КОЛОНОК
 function clearColumnCache() {
-  CACHE.remove("column_indices");
+  const cacheKeys = ['column_indices', 'report_header_map_v1', 'suppliers_data_v2'];
+  cacheKeys.forEach(key => CACHE.remove(key));
+  clearRuntimeSheetCache();
   scriptProps.deleteProperty('COL_IDX_BACKUP');
   COL_IDX = {};
-  console.log('✅ Кэш колонок очищен');
+  console.log('✅ Все кэши колонок очищены');
   const ui = SpreadsheetApp.getUi();
   ui.alert('✅ Кэш колонок очищен', 'При следующем запуске индексы будут пересчитаны.', ui.ButtonSet.OK);
 }
@@ -419,6 +492,10 @@ function setupPropertyCleanupTrigger() {
 }
 
 function setBotCommands() {
+  if (!CONFIG.TOKEN) {
+    console.error('❌ BOT_TOKEN не задан в Script Properties');
+    return;
+  }
   const commands = [
     { command: 'mapping', description: 'Маршрут' },
     { command: 'vamexpress', description: 'ВамЭкспресс (Сверка)' },
@@ -437,6 +514,10 @@ function setBotCommands() {
 // ===================== TELEGRAM CORE =====================
 function sendTelegram(payload) {
   try {
+    if (!CONFIG.TOKEN) {
+      return { ok: false, description: 'BOT_TOKEN is not configured in Script Properties' };
+    }
+
     // 🔥 ПРЕДВАРИТЕЛЬНАЯ ПРОВЕРКА ТЕКСТА НА ОШИБКИ MARKDOWN
     if (payload.parse_mode === 'MarkdownV2') {
       // Проверяем незакрытые скобки и прочие ошибки
@@ -485,6 +566,18 @@ function sendTelegram(payload) {
       } catch(e) {
         return { ok: false, description: 'Retry failed' };
       }
+    }
+
+    // Повтор при временных ошибках Telegram API (5xx)
+    if (!data.ok && Number(data.error_code) >= 500) {
+      Utilities.sleep(500);
+      const retry5xxResp = UrlFetchApp.fetch(`https://api.telegram.org/bot${CONFIG.TOKEN}/sendMessage`, {
+        method: 'post',
+        contentType: 'application/json',
+        payload: JSON.stringify(payload),
+        muteHttpExceptions: true
+      });
+      return safeJsonParse(retry5xxResp.getContentText(), { ok: false, description: 'Retry 5xx failed' });
     }
     
     // 🔥 СОХРАНЯЕМ ID СООБЩЕНИЯ ДЛЯ КАРТОЧЕК
@@ -566,11 +659,17 @@ function sendMessage(
   uid = null,
   opts = {}
 ) {
+  if (!CONFIG.TOKEN) {
+    console.error('❌ BOT_TOKEN не настроен');
+    return;
+  }
+
+  const markdownEnabled = !opts || opts.markdown !== false;
   const payload = {
     chat_id: chatId,
     text: text,
     disable_web_page_preview: true,
-    ...(opts.markdown !== false && { parse_mode: 'MarkdownV2' }),
+    ...(markdownEnabled && { parse_mode: 'MarkdownV2' }),
     ...(keyboard && { reply_markup: keyboard }),
     ...(uid && { _uid: uid })
   };
@@ -593,7 +692,8 @@ function addToQueue(payload) {
   try {
     // Пробуем CacheService
     const cached = CACHE.get(cacheKey);
-    let queue = cached ? JSON.parse(cached) : [];
+    let queue = cached ? safeJsonParse(cached, []) : [];
+    if (!Array.isArray(queue)) queue = [];
     queue.push(payload);
     CACHE.put(cacheKey, JSON.stringify(queue), 3600); // 1 час
     
@@ -615,12 +715,12 @@ function addToQueue(payload) {
 
 // 🔥 БЕЗОПАСНАЯ processQueueFast БЕЗ ПОТЕРИ СООБЩЕНИЙ
 function processQueueFast() {
-  if (!lockService.tryLock(5000)) {
-    console.log('⏳ Очередь уже обрабатывается другим процессом');
-    return;
-  }
+  let lockAcquired = false;
   
   try {
+    lockService.waitLock(10000);
+    lockAcquired = true;
+
     // 1. Получаем очередь из кэша (приоритет) или Properties
     let queue = [];
     let queueSource = 'cache';
@@ -628,7 +728,7 @@ function processQueueFast() {
     try {
       const cached = CACHE.get('tg_queue_cache');
       if (cached) {
-        queue = JSON.parse(cached);
+        queue = safeJsonParse(cached, []);
       }
     } catch (e) {
       console.warn('Не удалось получить очередь из CacheService:', e);
@@ -664,12 +764,26 @@ function processQueueFast() {
     const maxMessages = Math.min(20, queue.length); // Ограничиваем за один запуск
     const toProcess = queue.slice(0, maxMessages);
     const remainingInQueue = queue.slice(maxMessages);
+
+    // 3. Сохраняем "хвост" ДО обработки, чтобы при падении не потерять необработанные сообщения
+    try {
+      if (remainingInQueue.length > 0) {
+        CACHE.put('tg_queue_cache', JSON.stringify(remainingInQueue), 3600);
+        setWithTTL('tg_queue', remainingInQueue, 60);
+      } else {
+        CACHE.remove('tg_queue_cache');
+        scriptProps.deleteProperty('tg_queue');
+        scriptProps.deleteProperty('ttl_tg_queue');
+      }
+    } catch (e) {
+      console.warn('⚠️ Не удалось предварительно сохранить хвост очереди:', e.message);
+    }
     
     let failed = [];
     let sentCount = 0;
     let errorCount = 0;
     
-    // 3. Обрабатываем сообщения
+    // 4. Обрабатываем сообщения
     for (let i = 0; i < toProcess.length; i++) {
       const msg = toProcess[i];
 
@@ -683,21 +797,11 @@ function processQueueFast() {
         // 🔥 ПРОБНЫЙ РЕЖИМ: если DEBUG, проверяем Markdown
         if (CONFIG.DEBUG && msg.parse_mode === 'MarkdownV2') {
           const testText = msg.text || '';
-          const unsafePatterns = [
-            /\[[^\]]*$/m,  // незакрытая скобка
-            /\([^\)]*$/m,  // незакрытая круглая скобка
-            /(?<!\\)\./,   // неэкранированная точка
-            /(?<!\\)\-/,   // неэкранированный минус
-            /(?<!\\)\+/,   // неэкранированный плюс
-            /(?<!\\)=/,    // неэкранированный знак равенства
-          ];
-          
-          for (const pattern of unsafePatterns) {
-            if (pattern.test(testText)) {
-              console.warn(`⚠️ Обнаружен опасный символ в Markdown: ${pattern}`);
-              console.log(`   Текст: ${testText.substring(0, 200)}`);
-              // Автоматически экранируем опасные символы
-              msg.text = testText.replace(pattern, match => '\\' + match);
+          if (testText) {
+            const escaped = mdSafe(testText);
+            if (escaped !== testText) {
+              console.warn('⚠️ DEBUG: текст был безопасно экранирован для Markdown');
+              msg.text = escaped;
             }
           }
         }
@@ -763,10 +867,10 @@ function processQueueFast() {
       }
     }
     
-    // 4. Формируем финальную очередь (ошибки + необработанные)
+    // 5. Формируем финальную очередь (ошибки + необработанные)
     const finalQueue = failed.concat(remainingInQueue);
     
-    // 5. Сохраняем в оба хранилища для надежности
+    // 6. Сохраняем в оба хранилища для надежности
     if (finalQueue.length > 0) {
       console.log(`📊 Сохраняем очередь: ${finalQueue.length} сообщений`);
       
@@ -789,7 +893,7 @@ function processQueueFast() {
       scriptProps.deleteProperty('ttl_tg_queue');
     }
     
-    // 6. Логируем результат
+    // 7. Логируем результат
     console.log(`📊 Итог обработки очереди:
     • Отправлено: ${sentCount}
     • Ошибок: ${errorCount}
@@ -820,10 +924,12 @@ function processQueueFast() {
     }
     
   } finally {
-    try {
-      lockService.releaseLock();
-    } catch (e) {
-      console.error('Не удалось освободить блокировку:', e);
+    if (lockAcquired) {
+      try {
+        lockService.releaseLock();
+      } catch (e) {
+        console.error('Не удалось освободить блокировку:', e);
+      }
     }
   }
 }
@@ -997,11 +1103,19 @@ function normalizeSupplierName(name) {
   return String(name).trim().toLowerCase().replace(/\s+/g, '').replace(/[^0-9a-zа-яё]/gi, '');
 }
 
-function getToday() { return Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'dd.MM.yyyy'); }
+function getToday() {
+  const tz = CONFIG.TIMEZONE || Session.getScriptTimeZone();
+  return Utilities.formatDate(new Date(), tz, 'dd.MM.yyyy');
+}
+
+function formatDateLocal(date) {
+  const tz = CONFIG.TIMEZONE || Session.getScriptTimeZone();
+  return Utilities.formatDate(date, tz, 'dd.MM.yyyy');
+}
 
 function getRowDateString(value) {
   if (value instanceof Date) {
-    return Utilities.formatDate(value, Session.getScriptTimeZone(), 'dd.MM.yyyy');
+    return formatDateLocal(value);
   }
 
   const dateStr = String(value || '').trim();
@@ -1018,11 +1132,18 @@ function getOrdersDateColumnIndex() {
 }
 
 function getTodayOrderRows() {
+  const today = getToday();
+  if (
+    RUNTIME_CACHE.todayOrderRows &&
+    RUNTIME_CACHE.todayOrderRows.date === today &&
+    Array.isArray(RUNTIME_CACHE.todayOrderRows.rows)
+  ) {
+    return RUNTIME_CACHE.todayOrderRows.rows;
+  }
+
   initColumns();
 
-  const ordersSheet = SpreadsheetApp
-    .openById(CONFIG.SPREADSHEET_ID)
-    .getSheetByName(CONFIG.SHEETS.ORDERS);
+  const ordersSheet = getSheet(CONFIG.SHEETS.ORDERS);
 
   if (!ordersSheet) {
     throw new Error('Не найдена таблица "Заказы"');
@@ -1033,7 +1154,6 @@ function getTodayOrderRows() {
 
   const lastColumn = ordersSheet.getLastColumn();
   const data = ordersSheet.getRange(3, 1, lastRow - 2, lastColumn).getValues();
-  const today = getToday();
   const dateColumnIdx = getOrdersDateColumnIndex();
 
   const rows = [];
@@ -1051,6 +1171,7 @@ function getTodayOrderRows() {
     });
   });
 
+  RUNTIME_CACHE.todayOrderRows = { date: today, rows };
   return rows;
 }
 
@@ -1435,7 +1556,7 @@ function collectExtraTasksBySupplier() {
   data.forEach((r, i) => {
     const [date, art, sup, sum, cur, todo] = r;
     if (!(date instanceof Date)) return;
-    if (Utilities.formatDate(date, Session.getScriptTimeZone(), 'dd.MM.yyyy') !== today) return;
+    if (formatDateLocal(date) !== today) return;
     
     const supNorm = sup ? normalizeSupplierName(sup) : '__NO_SUPPLIER__';
     const uid = `ex_${Utilities.getUuid().slice(0, 8)}`;
@@ -1500,10 +1621,7 @@ function sendOrdersToTelegram() {
 	      // 🔥 2. КЭШИРУЕМ ДАННЫЕ ПОСТАВЩИКОВ (ИСПРАВЛЕННЫЙ КОД)
 	      const { supInfo } = getSuppliersData(); 
 	      
-	      // Отправка номеров заказов и ссылок на документы в личный чат
-	      sendPrintDocumentsOnBotStart();
-
-    // 1. ✅ Заказы — ВСЕ за сегодня по колонке "Дата отгрузки"
+	    // 1. ✅ Заказы — ВСЕ за сегодня по колонке "Дата отгрузки"
     const ordersSheet = SpreadsheetApp
       .openById(CONFIG.SPREADSHEET_ID)
       .getSheetByName(CONFIG.SHEETS.ORDERS);
@@ -1974,7 +2092,7 @@ function editMessageFull(chatId, messageId, text, keyboard = null, useMarkdown =
 
 function reconcileVamExpress(realSum, userName = 'Система') { 
   try {
-    const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+    const ss = getSpreadsheet();
     
     // 🔥 ЗАЩИТА: проверяем OCR суммы
     const ocrSums = ss.getSheetByName(CONFIG.SHEETS.OCR_SUMS).getDataRange().getValues().slice(1)
@@ -1996,6 +2114,8 @@ function reconcileVamExpress(realSum, userName = 'Система') {
     const extraData = extraSheet.getDataRange().getValues().slice(1);
     
     let matchedOrders = [], matchedSum = 0;
+    const rowsToDelete = [];
+    const ordersToUpdate = [];
     
     for (let i = extraData.length - 1; i >= 0; i--) {
       const orderSum = parsePrice(extraData[i][2]);
@@ -2004,12 +2124,35 @@ function reconcileVamExpress(realSum, userName = 'Система') {
       
       const idx = ocrSums.findIndex(s => Math.abs(s - sumToGive) < 0.06);
       if (idx !== -1) { 
-        matchedOrders.push(String(extraData[i][0] || '').trim()); 
+        const orderNum = String(extraData[i][0] || '').trim();
+        matchedOrders.push(orderNum); 
         matchedSum += sumToGive; 
-        extraSheet.deleteRow(i + 2); 
-        updateStatusByOrderNum(extraData[i][0], 'Продан'); 
+        rowsToDelete.push(i + 2);
+        ordersToUpdate.push(orderNum);
         ocrSums.splice(idx, 1); 
       }
+    }
+
+    // Обновляем статусы заказов после расчета
+    ordersToUpdate.forEach(orderNum => updateStatusByOrderNum(orderNum, 'Продан'));
+
+    // Удаляем строки пакетно (снизу вверх, сгруппированные сегменты)
+    if (rowsToDelete.length > 0) {
+      const sortedDesc = rowsToDelete.sort((a, b) => b - a);
+      let segmentMax = sortedDesc[0];
+      let segmentMin = sortedDesc[0];
+
+      for (let i = 1; i < sortedDesc.length; i++) {
+        const row = sortedDesc[i];
+        if (row === segmentMin - 1) {
+          segmentMin = row;
+          continue;
+        }
+        extraSheet.deleteRows(segmentMin, segmentMax - segmentMin + 1);
+        segmentMax = row;
+        segmentMin = row;
+      }
+      extraSheet.deleteRows(segmentMin, segmentMax - segmentMin + 1);
     }
     
     // 🔥 ЗАЩИТА: проверяем matchedOrders перед join
@@ -2604,29 +2747,25 @@ function handleDialogs(text, chatId, userName = 'Пользователь') {
 // 🔥 ОБНОВЛЕННЫЙ writeReport С ИМЕНЕМ ПОЛЬЗОВАТЕЛЯ И ДИНАМИЧЕСКИМИ КОЛОНКАМИ
 function writeReport(byn, usd, art, purp, userName = 'Система') {
   try {
-    const ss = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
-    const sheet = ss.getSheetByName(CONFIG.SHEETS.REPORTS);
-    if (!sheet) return;
-    
-    const rawHeaders = sheet.getRange(4, 1, 1, sheet.getLastColumn()).getValues()[0];
-    const headers = rawHeaders.map(h => String(h).replace(/\s+/g, ' ').trim().toLowerCase());
-    
-    const rowData = new Array(rawHeaders.length).fill('');
-    
-    // Ищем индексы (теперь более гибко)
-    const idxDate = headers.findIndex(h => h.includes('дата'));
-    const idxByn = headers.findIndex(h => h.includes('byn') || h.includes('сумма'));
-    const idxUsd = headers.findIndex(h => h.includes('usd') || h.includes('доллар'));
-    const idxArt = headers.findIndex(h => h.includes('статья'));
-    const idxPurp = headers.findIndex(h => h.includes('платежа'));
-    const idxWho = headers.findIndex(h => h.includes('кто') || h.includes('выполнил') || h.includes('исполнитель'));
+    byn = (byn === '' || byn === undefined || byn === null) ? '' : Number(byn);
+    usd = (usd === '' || usd === undefined || usd === null) ? '' : Number(usd);
+    if (byn !== '' && isNaN(byn)) byn = '';
+    if (usd !== '' && isNaN(usd)) usd = '';
 
-    if (idxDate !== -1) rowData[idxDate] = getToday();
-    if (idxByn !== -1) rowData[idxByn] =  byn === '' ? '' : byn;
-    if (idxUsd !== -1) rowData[idxUsd] =  usd === '' ? '' : usd;
-    if (idxArt !== -1) rowData[idxArt] = art;
-    if (idxPurp !== -1) rowData[idxPurp] = String(purp || '');
-    if (idxWho !== -1) rowData[idxWho] = userName;
+    const sheet = getSheet(CONFIG.SHEETS.REPORTS);
+    if (!sheet) return;
+
+    const headerMap = getReportHeaderMap();
+    if (!headerMap || !headerMap.length) return;
+
+    const rowData = new Array(headerMap.length).fill('');
+
+    if (headerMap.idxDate !== -1) rowData[headerMap.idxDate] = getToday();
+    if (headerMap.idxByn !== -1) rowData[headerMap.idxByn] = byn === '' ? '' : byn;
+    if (headerMap.idxUsd !== -1) rowData[headerMap.idxUsd] = usd === '' ? '' : usd;
+    if (headerMap.idxArt !== -1) rowData[headerMap.idxArt] = art;
+    if (headerMap.idxPurp !== -1) rowData[headerMap.idxPurp] = String(purp || '');
+    if (headerMap.idxWho !== -1) rowData[headerMap.idxWho] = userName;
     
     sheet.appendRow(rowData);
     
@@ -2660,8 +2799,7 @@ function getStatusColumnIndex(sheet) {
 // 🔥 ОПТИМИЗИРОВАННЫЙ updateOrderStatus С ПАКЕТНЫМ ОБНОВЛЕНИЕМ
 function updateOrderStatus(rows, status) {
   try {
-    const sheet = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID)
-      .getSheetByName(CONFIG.SHEETS.ORDERS);
+    const sheet = getSheet(CONFIG.SHEETS.ORDERS);
     
     if (!sheet) {
       console.error('❌ Таблица "Заказы" не найдена');
@@ -2775,7 +2913,7 @@ function updateOrderStatus(rows, status) {
 // 🔥 ОБНОВЛЕННАЯ updateStatusByOrderNum С ДИНАМИЧЕСКОЙ КОЛОНКОЙ СТАТУСА
 function updateStatusByOrderNum(num, status) {
   try {
-    const sheet = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID).getSheetByName(CONFIG.SHEETS.ORDERS);
+    const sheet = getSheet(CONFIG.SHEETS.ORDERS);
     if (!sheet) {
       console.error('❌ Таблица "Заказы" не найдена');
       return;
@@ -2792,37 +2930,61 @@ function updateStatusByOrderNum(num, status) {
     const cols = initColumns();
     const orderNumColIdx = cols.ORDER_NUM + 1; 
     
-    const range = sheet.getRange(1, orderNumColIdx, lastRow, 1);
-    const cells = range.createTextFinder(String(num).trim()).matchEntireCell(true).findAll();
-    
-    if (cells.length === 0) {
+    const targetNum = String(num).trim();
+    const dataLength = lastRow - 2;
+    const orderValues = sheet.getRange(3, orderNumColIdx, dataLength, 1).getValues();
+    const modelValues = sheet.getRange(3, COL_IDX.MODEL + 1, dataLength, 1).getValues();
+    const statusValues = sheet.getRange(3, statusColumnIndex, dataLength, 1).getValues();
+
+    const rowsToUpdate = [];
+    let matchedCount = 0;
+    for (let i = 0; i < dataLength; i++) {
+      const row = i + 3;
+      const orderVal = String(orderValues[i][0] || '').trim();
+      if (orderVal !== targetNum) continue;
+      matchedCount++;
+
+      const modelVal = String(modelValues[i][0] || '').trim();
+      if (!orderVal && !modelVal) {
+        console.warn(`⚠️ Строка ${row} возможно удалена (пустые данные)`);
+        continue;
+      }
+
+      const currentStatus = statusValues[i][0];
+      if (String(currentStatus) !== String(status)) {
+        rowsToUpdate.push(row);
+      }
+    }
+
+    if (matchedCount === 0) {
       console.log(`ℹ️ Номер заказа "${num}" не найден в таблице`);
       return;
     }
+    if (rowsToUpdate.length === 0) {
+      console.log(`ℹ️ Статус для заказа "${num}" уже актуален`);
+      return;
+    }
     
+    rowsToUpdate.sort((a, b) => a - b);
     let updatedCount = 0;
-    cells.forEach(c => {
-      const row = c.getRow();
-      
-      // 🔥 Пропускаем заголовки и удаленные строки
-      if (row <= 2) return;
-      
-      const statusCell = sheet.getRange(row, statusColumnIndex);
-      const currentStatus = statusCell.getValue();
-      
-      // 🔥 Проверяем, что строка не удалена
-      if (statusCell.isBlank() && currentStatus === '' && sheet.getRange(row, orderNumColIdx).isBlank()) {
-        console.warn(`⚠️ Строка ${row} возможно удалена (пустые данные)`);
-        return;
+    let start = rowsToUpdate[0];
+    let prev = rowsToUpdate[0];
+    const flushSegment = (segmentStart, segmentEnd) => {
+      const height = segmentEnd - segmentStart + 1;
+      const values = Array.from({ length: height }, () => [status]);
+      sheet.getRange(segmentStart, statusColumnIndex, height, 1).setValues(values);
+      updatedCount += height;
+    };
+
+    for (let i = 1; i < rowsToUpdate.length; i++) {
+      const current = rowsToUpdate[i];
+      if (current !== prev + 1) {
+        flushSegment(start, prev);
+        start = current;
       }
-      
-      // 🔥 Обновляем только если статус изменился
-      if (String(currentStatus) !== String(status)) {
-        statusCell.setValue(status);
-        updatedCount++;
-        console.log(`✅ Обновлен статус заказа ${num} в строке ${row}: ${currentStatus} → ${status}`);
-      }
-    });
+      prev = current;
+    }
+    flushSegment(start, prev);
     
     console.log(`📊 Обновлено статусов для заказа ${num}: ${updatedCount} строк`);
     
@@ -2848,44 +3010,58 @@ function getUsdRateCached() {
 }
 
 function buildRoute(chatId) {
-  const key = `route_${CONFIG.CHAT_ID}`;
-  const addresses = getWithTTL(key);
-  
-  if (!addresses || !addresses.length) {
-    return sendMessage('📭 *Маршрут пуст*\\. Добавьте адреса кнопкой «➕ В маршрут»', null, chatId);
-  }
-  
-  sendMessage('🔄 _Строю маршрут, подождите..._', null, chatId);
-  
-  const coords = addresses.map(addr => {
-    try {
-      const url = `https://geocode-maps.yandex.ru/1.x/?format=json&apikey=${CONFIG.YANDEX_API_KEY}&geocode=${encodeURIComponent(cleanAddress(addr))}`;
-      const resp = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
-      const res = JSON.parse(resp.getContentText());
-      const pos = res.response?.GeoObjectCollection?.featureMember[0]?.GeoObject?.Point?.pos;
-      return pos ? pos.split(' ').reverse().join(',') : null;
-    } catch(e) { 
-      logDebug('Geocode error for ' + addr + ': ' + e.message);
-      return null; 
+  try {
+    const key = `route_${CONFIG.CHAT_ID}`;
+    const addresses = getWithTTL(key);
+    
+    if (!addresses || !addresses.length) {
+      return sendMessage('📭 *Маршрут пуст*\\. Добавьте адреса кнопкой «➕ В маршрут»', null, chatId);
     }
-  }).filter(c => c);
-  
-  if (!coords.length) {
-    return sendMessage('❌ Не удалось найти координаты для адресов в списке', null, chatId);
+
+    try {
+      UrlFetchApp.fetch(`https://api.telegram.org/bot${CONFIG.TOKEN}/sendChatAction`, {
+        method: 'post',
+        contentType: 'application/json',
+        payload: JSON.stringify({ chat_id: chatId, action: 'typing' }),
+        muteHttpExceptions: true
+      });
+    } catch (e) {}
+    
+    sendMessage('🔄 _Строю маршрут, подождите..._', null, chatId);
+    
+    const coords = addresses.map(addr => {
+      try {
+        const url = `https://geocode-maps.yandex.ru/1.x/?format=json&apikey=${CONFIG.YANDEX_API_KEY}&geocode=${encodeURIComponent(cleanAddress(addr))}`;
+        const resp = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+        const res = JSON.parse(resp.getContentText());
+        const pos = res.response?.GeoObjectCollection?.featureMember[0]?.GeoObject?.Point?.pos;
+        return pos ? pos.split(' ').reverse().join(',') : null;
+      } catch(e) { 
+        logDebug('Geocode error for ' + addr + ': ' + e.message);
+        return null; 
+      }
+    }).filter(c => c);
+    
+    if (!coords.length) {
+      return sendMessage('❌ Не удалось найти координаты для адресов в списке', null, chatId);
+    }
+    
+    const routeUrl = `https://yandex.ru/maps/?rtext=~${coords.join('~')}&rtt=auto`;
+    const count = addresses.length;
+    const text = mdSafe(`🚗 Маршрут построен (${count} точек)`);
+    
+    const kb = { 
+      inline_keyboard: [
+        [{ text: '🗺️ Открыть Яндекс Карты', url: routeUrl }],
+        [{ text: '🗑️ Очистить маршрут', callback_data: 'clear_route_confirm' }] 
+      ]
+    };
+    
+    sendMessage(text, kb, chatId);
+  } catch (error) {
+    console.error('Ошибка построения маршрута:', error);
+    sendMessage('❌ Не удалось построить маршрут. Попробуйте позже.', null, chatId, CONFIG.SEND_MODE.FAST, null, { markdown: false });
   }
-  
-  const routeUrl = `https://yandex.ru/maps/?rtext=~${coords.join('~')}&rtt=auto`;
-  const count = addresses.length;
-  const text = mdSafe(`🚗 Маршрут построен (${count} точек)`);
-  
-  const kb = { 
-    inline_keyboard: [
-      [{ text: '🗺️ Открыть Яндекс Карты', url: routeUrl }],
-      [{ text: '🗑️ Очистить маршрут', callback_data: 'clear_route_confirm' }] 
-    ]
-  };
-  
-  sendMessage(text, kb, chatId);
 }
 
 function handleVamPhoto(msg) {
@@ -3172,24 +3348,25 @@ function checkMemoryUsage() {
   const props = scriptProps.getProperties();
   const propsSize = JSON.stringify(props).length;
   const propsCount = Object.keys(props).length;
+  const percentUsed = (propsSize / 500000) * 100;
   
   console.log(`📊 Использование памяти ScriptProperties:`);
   console.log(`   • Ключей: ${propsCount}`);
   console.log(`   • Размер: ${(propsSize / 1024).toFixed(2)} KB`);
   console.log(`   • Лимит: ~500 KB`);
-  console.log(`   • Использовано: ${((propsSize / 500000) * 100).toFixed(1)}%`);
+  console.log(`   • Использовано: ${percentUsed.toFixed(1)}%`);
   
-  // Уведомление если превышаем 70%
-  if (propsSize > 350000 && CONFIG.DEBUG) {
+  // Уведомление если превышаем 80%
+  if (percentUsed > 80 && CONFIG.DEBUG) {
     sendMessage(
-      `⚠️ *ВНИМАНИЕ: ScriptProperties на ${((propsSize / 500000) * 100).toFixed(1)}%*\n` +
+      `⚠️ *КРИТИЧЕСКОЕ: ScriptProperties на ${percentUsed.toFixed(1)}%*\n` +
       `Ключей: ${propsCount}\n` +
-      `Рекомендуется запустить очистку в меню Бота → Очистить старые свойства`,
+      `НЕОБХОДИМО срочно запустить очистку!`,
       null, CONFIG.CHAT_ID, CONFIG.SEND_MODE.FAST
     );
   }
   
-  return { size: propsSize, count: propsCount, percent: (propsSize / 500000) * 100 };
+  return { size: propsSize, count: propsCount, percent: percentUsed };
 }
 
 // 🔥 НОВАЯ ФУНКЦИЯ ДЛЯ ПРОВЕРКИ КОЛОНКИ СТАТУСА
